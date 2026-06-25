@@ -1,0 +1,31 @@
+name: LiveCaption
+options:
+  bundleIdPrefix: com.aiml.livecaption
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    ENABLE_HARDENED_RUNTIME: NO
+    GENERATE_INFOPLIST_FILE: YES
+
+targets:
+  LiveCaption:
+    type: application
+    platform: macOS
+    sources:
+      - LiveCaption
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aiml.livecaption.LiveCaption
+        INFOPLIST_KEY_NSCameraUsageDescription: "LiveCaption uses the camera to detect faces and lip motion for speaker attribution."
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "LiveCaption uses the microphone to capture speech for live transcription."
+        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.utilities"
+        INFOPLIST_KEY_NSPrincipalClass: "NSApplication"
