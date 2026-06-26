@@ -67,7 +67,10 @@ struct ContentView: View {
 
     private var speakerSidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Speakers").font(.headline).padding()
+            Text("Speakers").font(.headline)
+                .padding(.horizontal).padding(.top)
+            fusionStatus
+                .padding(.horizontal).padding(.vertical, 8)
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -160,6 +163,7 @@ struct ContentView: View {
             permissionDot("Mic", granted: capture.microphoneAuthorized)
 
             audioMeter
+            speechIndicator
 
             Spacer()
 
@@ -193,6 +197,34 @@ struct ContentView: View {
             }
             .frame(width: 90, height: 8)
         }
+    }
+
+    /// Lights up when the VAD hears speech — the audio half of overlap fusion.
+    private var speechIndicator: some View {
+        HStack(spacing: 5) {
+            Circle().fill(capture.audioSpeechActive ? Color.green : Color.secondary)
+                .frame(width: 9, height: 9)
+            Text("Speech").font(.callout)
+                .foregroundStyle(capture.audioSpeechActive ? .primary : .secondary)
+        }
+    }
+
+    /// Shows the two overlap cues independently so it's clear which one is (not)
+    /// firing: orange = condition met. Overlap banner needs BOTH lit.
+    private var fusionStatus: some View {
+        HStack(spacing: 8) {
+            miniBadge("2+ lips", on: capture.activeSpeakerCount >= 2, system: "mouth")
+            miniBadge("speech", on: capture.audioSpeechActive, system: "waveform")
+            Spacer()
+        }
+    }
+
+    private func miniBadge(_ text: String, on: Bool, system: String) -> some View {
+        Label(text, systemImage: system)
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(on ? Color.orange.opacity(0.25) : Color.gray.opacity(0.15), in: Capsule())
+            .foregroundStyle(on ? Color.primary : Color.secondary)
     }
 
     private var meterColor: Color {

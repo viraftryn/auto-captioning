@@ -18,6 +18,8 @@ final class CaptureManager: NSObject, ObservableObject {
     @Published private(set) var overlapDetected: Bool = false
     @Published private(set) var fps: Double = 0
     @Published private(set) var audioLevel: Float = 0
+    @Published private(set) var audioSpeechActive: Bool = false
+    @Published private(set) var speechLevel: Float = 0
     @Published private(set) var isRunning = false
     @Published private(set) var cameraAuthorized = false
     @Published private(set) var microphoneAuthorized = false
@@ -31,7 +33,12 @@ final class CaptureManager: NSObject, ObservableObject {
     private let faceProcessor = FaceLandmarkProcessor()
     private let detector = LipActivityDetector()
     private let audioEngine = AudioEngine()
+    private let vad = VoiceActivityDetector()
     private var isConfigured = false
+
+    // Latest evidence for cross-modal overlap (main-thread only).
+    private var lastVisualOverlap = false
+    private var lastAudioSpeech = false
 
     // Rolling 1-second window of frame timestamps, for an FPS readout.
     private var frameTimes: [CFTimeInterval] = []
@@ -40,6 +47,18 @@ final class CaptureManager: NSObject, ObservableObject {
         super.init()
         audioEngine.onLevel = { [weak self] level in
             DispatchQueue.main.async { self?.audioLevel = level }
+        }
+        audioEngine.onBuffer = { [weak self] buffer in
+            guard let self else { return }
+            self.vad.process(buffer: buffer, now: CACurrentMediaTime())
+            let speech = self.vad.isSpeech
+            let level = self.vad.speechLevel
+            DispatchQueue.main.async {
+                self.audioSpeechActive = speech
+                self.speechLevel = level
+                self.lastAudioSpeech = speech
+                self.recomputeOverlap()
+            }
         }
     }
 
@@ -86,8 +105,13 @@ final class CaptureManager: NSObject, ObservableObject {
         audioEngine.stop()
         videoQueue.async { self.detector.reset() }
         DispatchQueue.main.async {
+            self.vad.reset()
             self.isRunning = false
             self.audioLevel = 0
+            self.audioSpeechActive = false
+            self.speechLevel = 0
+            self.lastAudioSpeech = false
+            self.lastVisualOverlap = false
             self.trackedFaces = []
             self.faceCount = 0
             self.activeSpeakerCount = 0
@@ -103,6 +127,12 @@ final class CaptureManager: NSObject, ObservableObject {
     /// never races with frame processing).
     func setConfig(_ config: LipActivityConfig) {
         videoQueue.async { self.detector.config = config }
+    }
+
+    /// Overlap requires BOTH cues: 2+ mouths moving (video) and speech actually
+    /// present (audio). Recomputed on the main thread whenever either updates.
+    private func recomputeOverlap() {
+        overlapDetected = lastVisualOverlap && lastAudioSpeech
     }
 
     // MARK: - Authorization
@@ -182,7 +212,8 @@ extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate {
                 self.trackedFaces = result.faces
                 self.faceCount = result.faces.count
                 self.activeSpeakerCount = result.activeCount
-                self.overlapDetected = result.overlap
+                self.lastVisualOverlap = result.overlap
+                self.recomputeOverlap()
             }
         }
 
