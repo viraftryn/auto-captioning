@@ -12,8 +12,10 @@ import QuartzCore
 final class CaptureManager: NSObject, ObservableObject {
 
     // MARK: Published state
-    @Published private(set) var faceObservations: [VNFaceObservation] = []
+    @Published private(set) var trackedFaces: [TrackedFace] = []
     @Published private(set) var faceCount: Int = 0
+    @Published private(set) var activeSpeakerCount: Int = 0
+    @Published private(set) var overlapDetected: Bool = false
     @Published private(set) var fps: Double = 0
     @Published private(set) var audioLevel: Float = 0
     @Published private(set) var isRunning = false
@@ -27,6 +29,7 @@ final class CaptureManager: NSObject, ObservableObject {
     private let sessionQueue = DispatchQueue(label: "com.aiml.livecaption.session")
     private let videoQueue = DispatchQueue(label: "com.aiml.livecaption.video", qos: .userInitiated)
     private let faceProcessor = FaceLandmarkProcessor()
+    private let detector = LipActivityDetector()
     private let audioEngine = AudioEngine()
     private var isConfigured = false
 
@@ -81,17 +84,26 @@ final class CaptureManager: NSObject, ObservableObject {
             if self.session.isRunning { self.session.stopRunning() }
         }
         audioEngine.stop()
+        videoQueue.async { self.detector.reset() }
         DispatchQueue.main.async {
             self.isRunning = false
             self.audioLevel = 0
-            self.faceObservations = []
+            self.trackedFaces = []
             self.faceCount = 0
+            self.activeSpeakerCount = 0
+            self.overlapDetected = false
             self.fps = 0
             self.statusMessage = "Stopped"
         }
     }
 
     func toggle() { isRunning ? stop() : start() }
+
+    /// Push tuning changes to the detector (applied on the video queue so it
+    /// never races with frame processing).
+    func setConfig(_ config: LipActivityConfig) {
+        videoQueue.async { self.detector.config = config }
+    }
 
     // MARK: - Authorization
 
@@ -157,12 +169,20 @@ extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate {
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let imageSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer),
+                               height: CVPixelBufferGetHeight(pixelBuffer))
+        let now = CACurrentMediaTime()
 
         faceProcessor.detect(in: pixelBuffer) { [weak self] observations in
             guard let self else { return }
+            let result = self.detector.update(observations: observations,
+                                               imageSize: imageSize,
+                                               now: now)
             DispatchQueue.main.async {
-                self.faceObservations = observations
-                self.faceCount = observations.count
+                self.trackedFaces = result.faces
+                self.faceCount = result.faces.count
+                self.activeSpeakerCount = result.activeCount
+                self.overlapDetected = result.overlap
             }
         }
 

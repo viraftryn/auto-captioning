@@ -3,26 +3,57 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var capture = CaptureManager()
 
-    var body: some View {
-        VStack(spacing: 0) {
-            ZStack(alignment: .topLeading) {
-                CameraPreview(session: capture.session,
-                              observations: capture.faceObservations)
-                    .frame(minWidth: 640, minHeight: 360)
+    // Live-tunable detector settings (pushed to the detector on change).
+    @State private var talkThreshold: Double = 0.030
+    @State private var holdTime: Double = 0.35
 
-                infoOverlay.padding(12)
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                ZStack(alignment: .top) {
+                    CameraPreview(session: capture.session, faces: capture.trackedFaces)
+                        .frame(minWidth: 560, minHeight: 360)
+                    topOverlay.padding(12)
+                }
+                controlBar
             }
-            controlBar
+            Divider()
+            speakerSidebar.frame(width: 250)
         }
-        .onAppear { capture.start() }
+        .onAppear { capture.start(); pushConfig() }
         .onDisappear { capture.stop() }
     }
 
-    // MARK: Subviews
+    private func pushConfig() {
+        var config = LipActivityConfig()
+        config.activityOn = talkThreshold
+        config.activityOff = talkThreshold * 0.6
+        config.holdTime = holdTime
+        capture.setConfig(config)
+    }
 
-    private var infoOverlay: some View {
+    // MARK: - Preview overlay (badge + overlap banner)
+
+    private var topOverlay: some View {
+        VStack(spacing: 8) {
+            HStack { infoBadge; Spacer() }
+            if capture.overlapDetected {
+                Label("OVERLAP · \(capture.activeSpeakerCount) speakers talking",
+                      systemImage: "exclamationmark.2")
+                    .font(.system(.callout, design: .rounded).weight(.bold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.orange, in: Capsule())
+                    .foregroundStyle(.white)
+            }
+        }
+        .animation(.easeInOut(duration: 0.15), value: capture.overlapDetected)
+    }
+
+    private var infoBadge: some View {
         HStack(spacing: 10) {
             Label("\(capture.faceCount)", systemImage: "face.smiling")
+            Label("\(capture.activeSpeakerCount) active", systemImage: "waveform.badge.mic")
             Label("\(Int(capture.fps)) fps", systemImage: "speedometer")
         }
         .font(.system(.callout, design: .rounded).weight(.semibold))
@@ -31,6 +62,89 @@ struct ContentView: View {
         .background(.black.opacity(0.55), in: Capsule())
         .foregroundStyle(.white)
     }
+
+    // MARK: - Speakers sidebar
+
+    private var speakerSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Speakers").font(.headline).padding()
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if capture.trackedFaces.isEmpty {
+                        Text("No faces detected")
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 8)
+                    }
+                    ForEach(capture.trackedFaces) { speakerRow($0) }
+                }
+                .padding()
+            }
+            Divider()
+            tuningPanel.padding()
+        }
+        .background(.background)
+    }
+
+    private func speakerRow(_ face: TrackedFace) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Speaker \(face.id)").font(.subheadline.weight(.semibold))
+                Spacer()
+                if face.isActive {
+                    Text("ACTIVE")
+                        .font(.caption2.weight(.bold))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(.green, in: Capsule())
+                        .foregroundStyle(.white)
+                }
+            }
+            meterRow("LAR", value: face.smoothedLAR, max: 0.6, tint: .blue)
+            meterRow("Move", value: face.activity, max: 0.10, tint: face.isActive ? .green : .gray)
+        }
+        .padding(10)
+        .background(face.isActive ? Color.green.opacity(0.12) : Color.gray.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func meterRow(_ label: String, value: Double, max: Double, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .frame(width: 34, alignment: .leading)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.quaternary)
+                    Capsule().fill(tint)
+                        .frame(width: geo.size.width * Swift.min(1, CGFloat(value / max)))
+                }
+            }
+            .frame(height: 6)
+            Text(String(format: "%.3f", value))
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .frame(width: 42, alignment: .trailing)
+        }
+    }
+
+    private var tuningPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Tuning").font(.subheadline.weight(.semibold))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Talk threshold: \(String(format: "%.3f", talkThreshold))").font(.caption)
+                Slider(value: $talkThreshold, in: 0.005...0.080)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Hold time: \(String(format: "%.2f", holdTime)) s").font(.caption)
+                Slider(value: $holdTime, in: 0.1...1.0)
+            }
+        }
+        .onChange(of: talkThreshold) { pushConfig() }
+        .onChange(of: holdTime) { pushConfig() }
+    }
+
+    // MARK: - Control bar
 
     private var controlBar: some View {
         HStack(spacing: 16) {
@@ -62,9 +176,7 @@ struct ContentView: View {
 
     private func permissionDot(_ title: String, granted: Bool) -> some View {
         HStack(spacing: 5) {
-            Circle()
-                .fill(granted ? Color.green : Color.red)
-                .frame(width: 9, height: 9)
+            Circle().fill(granted ? Color.green : Color.red).frame(width: 9, height: 9)
             Text(title).font(.callout)
         }
     }
@@ -75,8 +187,7 @@ struct ContentView: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.quaternary)
-                    Capsule()
-                        .fill(meterColor)
+                    Capsule().fill(meterColor)
                         .frame(width: max(2, geo.size.width * CGFloat(capture.audioLevel)))
                 }
             }
