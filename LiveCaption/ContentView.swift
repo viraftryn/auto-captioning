@@ -4,8 +4,9 @@ struct ContentView: View {
     @StateObject private var capture = CaptureManager()
 
     // Live-tunable detector settings (pushed to the detector on change).
-    @State private var talkThreshold: Double = 0.030
+    @State private var talkThreshold: Double = 0.008
     @State private var holdTime: Double = 0.35
+    @State private var speechMargin: Double = 6
 
     var body: some View {
         HStack(spacing: 0) {
@@ -20,7 +21,11 @@ struct ContentView: View {
             Divider()
             speakerSidebar.frame(width: 250)
         }
-        .onAppear { capture.start(); pushConfig() }
+        .onAppear {
+            capture.start()
+            pushConfig()
+            capture.setSpeechMargin(Float(speechMargin))
+        }
         .onDisappear { capture.stop() }
     }
 
@@ -70,7 +75,9 @@ struct ContentView: View {
             Text("Speakers").font(.headline)
                 .padding(.horizontal).padding(.top)
             fusionStatus
-                .padding(.horizontal).padding(.vertical, 8)
+                .padding(.horizontal).padding(.top, 8)
+            audioDiagnostics
+                .padding(.horizontal).padding(.top, 4).padding(.bottom, 8)
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -103,7 +110,7 @@ struct ContentView: View {
                 }
             }
             meterRow("LAR", value: face.smoothedLAR, max: 0.6, tint: .blue)
-            meterRow("Move", value: face.activity, max: 0.10, tint: face.isActive ? .green : .gray)
+            meterRow("Move", value: face.activity, max: 0.03, tint: face.isActive ? .green : .gray)
         }
         .padding(10)
         .background(face.isActive ? Color.green.opacity(0.12) : Color.gray.opacity(0.08),
@@ -136,15 +143,20 @@ struct ContentView: View {
             Text("Tuning").font(.subheadline.weight(.semibold))
             VStack(alignment: .leading, spacing: 2) {
                 Text("Talk threshold: \(String(format: "%.3f", talkThreshold))").font(.caption)
-                Slider(value: $talkThreshold, in: 0.005...0.080)
+                Slider(value: $talkThreshold, in: 0.002...0.030)
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text("Hold time: \(String(format: "%.2f", holdTime)) s").font(.caption)
                 Slider(value: $holdTime, in: 0.1...1.0)
             }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Speech margin: \(String(format: "%.0f", speechMargin)) dB").font(.caption)
+                Slider(value: $speechMargin, in: 2...15)
+            }
         }
         .onChange(of: talkThreshold) { pushConfig() }
         .onChange(of: holdTime) { pushConfig() }
+        .onChange(of: speechMargin) { capture.setSpeechMargin(Float(speechMargin)) }
     }
 
     // MARK: - Control bar
@@ -225,6 +237,26 @@ struct ContentView: View {
             .padding(.horizontal, 6).padding(.vertical, 3)
             .background(on ? Color.orange.opacity(0.25) : Color.gray.opacity(0.15), in: Capsule())
             .foregroundStyle(on ? Color.primary : Color.secondary)
+    }
+
+    /// Live audio readout for debugging the VAD: a speech-confidence bar plus the
+    /// raw energy and adaptive noise floor in dB. If "audio" sits at ~-90 and
+    /// doesn't move when you talk, audio isn't reaching the app (check the Mic
+    /// dot); if it moves but speech stays off, it's a threshold issue.
+    private var audioDiagnostics: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(String(format: "audio %.0f dB · floor %.0f dB",
+                        capture.audioEnergyDB, capture.noiseFloorDB))
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+            if !capture.audioDeviceName.isEmpty {
+                Text("mic: \(capture.audioDeviceName)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
     }
 
     private var meterColor: Color {

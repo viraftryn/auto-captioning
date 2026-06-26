@@ -6,29 +6,30 @@ import QuartzCore
 struct TrackedFace: Identifiable {
     let id: Int                       // stable "Speaker N" id
     let observation: VNFaceObservation
-    let rawLAR: Double
+    let rawLAR: Double                // mouth openness (display)
     let smoothedLAR: Double
-    let activity: Double              // short-term lip motion (stddev of LAR)
+    let activity: Double              // articulation: lip motion minus head motion
     let isActive: Bool
 }
 
 /// Tunable parameters for active-speaker detection. Defaults are starting
 /// points — expect to tune `activityOn`/`activityOff` against the live readout.
 struct LipActivityConfig {
-    var smoothing: Double = 0.4           // EMA factor for LAR (0..1, higher = snappier)
-    var window: TimeInterval = 0.6        // activity (variance) window
-    var activityOn: Double = 0.030        // start "speaking" above this lip-motion
-    var activityOff: Double = 0.018       // stop below this (hysteresis)
+    var smoothing: Double = 0.4           // EMA factor for LAR + activity
+    var activityOn: Double = 0.008        // start "speaking" above this articulation
+    var activityOff: Double = 0.005       // stop below this (hysteresis)
     var holdTime: TimeInterval = 0.35     // keep active this long after motion stops
     var matchIoU: CGFloat = 0.2           // min IoU to keep the same speaker id
     var staleTimeout: TimeInterval = 0.5  // drop a speaker unseen for this long
 }
 
-/// Associates faces across frames (stable Speaker ids), computes a smoothed Lip
-/// Aperture Ratio per speaker, and flags active speakers + overlap.
+/// Associates faces across frames (stable Speaker ids), measures lip
+/// articulation per speaker, and flags active speakers + overlap.
 ///
-/// Implements the "Active speaker detection · Smoothed LAR + hold time" and
-/// "Overlap detected? (2+ lips active)" nodes of the pipeline.
+/// Articulation is computed as **lip-landmark motion minus the motion of stable
+/// reference landmarks (eyes + nose)**. Head/body movement shifts every landmark
+/// together, so subtracting the reference cancels it and leaves only true mouth
+/// movement — this is what stops fast body motion from reading as "speaking."
 ///
 /// Not thread-safe: call `update`/`reset`/`config` from a single serial queue.
 final class LipActivityDetector {
@@ -46,7 +47,8 @@ final class LipActivityDetector {
         var box: CGRect
         var smoothedLAR: Double = 0
         var initializedLAR = false
-        var samples: [(t: TimeInterval, lar: Double)] = []
+        var prevLip: [CGPoint]?
+        var prevRef: [CGPoint]?
         var activity: Double = 0
         var isActive = false
         var activeUntil: TimeInterval = 0
@@ -61,6 +63,12 @@ final class LipActivityDetector {
     }
 
     private var tracks: [Track] = []
+
+    // Landmark groups for the differential-motion measure.
+    private static let lipRegions: [KeyPath<VNFaceLandmarks2D, VNFaceLandmarkRegion2D?>] =
+        [\.outerLips, \.innerLips]
+    private static let refRegions: [KeyPath<VNFaceLandmarks2D, VNFaceLandmarkRegion2D?>] =
+        [\.leftEye, \.rightEye, \.nose, \.noseCrest]
 
     func reset() { tracks.removeAll() }
 
@@ -106,6 +114,7 @@ final class LipActivityDetector {
             track.box = obs.boundingBox
             track.lastSeen = now
 
+            // Mouth openness (display only).
             let raw = LipGeometry.lipApertureRatio(for: obs, imageSize: imageSize) ?? 0
             if track.initializedLAR {
                 track.smoothedLAR = config.smoothing * raw + (1 - config.smoothing) * track.smoothedLAR
@@ -114,11 +123,18 @@ final class LipActivityDetector {
                 track.initializedLAR = true
             }
 
-            // Activity = how much the mouth opening is *changing* (talking),
-            // not just how open it is.
-            track.samples.append((now, raw))
-            track.samples.removeAll { now - $0.t > config.window }
-            track.activity = Self.stddev(track.samples.map(\.lar))
+            // Articulation = lip motion minus reference (head) motion.
+            let lip = Self.points(obs.landmarks, Self.lipRegions)
+            let ref = Self.points(obs.landmarks, Self.refRegions)
+            if let prevLip = track.prevLip, let prevRef = track.prevRef,
+               prevLip.count == lip.count, prevRef.count == ref.count, !lip.isEmpty {
+                let lipMotion = Self.meanDisplacement(lip, prevLip)
+                let refMotion = ref.isEmpty ? 0 : Self.meanDisplacement(ref, prevRef)
+                let net = max(0, lipMotion - refMotion)
+                track.activity = config.smoothing * net + (1 - config.smoothing) * track.activity
+            }
+            track.prevLip = lip
+            track.prevRef = ref
 
             // Hysteresis + hold time keep the flag from flickering between words.
             if track.isActive {
@@ -154,18 +170,37 @@ final class LipActivityDetector {
         return id
     }
 
+    /// Concatenated, face-box-normalized points for the given regions. Because
+    /// the points are box-relative, head translation and scale are already
+    /// factored out; only rotation + jitter + articulation remain.
+    private static func points(_ landmarks: VNFaceLandmarks2D?,
+                               _ keyPaths: [KeyPath<VNFaceLandmarks2D, VNFaceLandmarkRegion2D?>]) -> [CGPoint] {
+        guard let landmarks else { return [] }
+        var result: [CGPoint] = []
+        for keyPath in keyPaths {
+            if let region = landmarks[keyPath: keyPath] {
+                result.append(contentsOf: region.normalizedPoints)
+            }
+        }
+        return result
+    }
+
+    private static func meanDisplacement(_ a: [CGPoint], _ b: [CGPoint]) -> Double {
+        guard a.count == b.count, !a.isEmpty else { return 0 }
+        var sum = 0.0
+        for i in a.indices {
+            let dx = Double(a[i].x - b[i].x)
+            let dy = Double(a[i].y - b[i].y)
+            sum += (dx * dx + dy * dy).squareRoot()
+        }
+        return sum / Double(a.count)
+    }
+
     private static func iou(_ a: CGRect, _ b: CGRect) -> CGFloat {
         let inter = a.intersection(b)
         guard !inter.isNull, inter.width > 0, inter.height > 0 else { return 0 }
         let interArea = inter.width * inter.height
         let union = a.width * a.height + b.width * b.height - interArea
         return union > 0 ? interArea / union : 0
-    }
-
-    private static func stddev(_ xs: [Double]) -> Double {
-        guard xs.count > 1 else { return 0 }
-        let mean = xs.reduce(0, +) / Double(xs.count)
-        let variance = xs.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(xs.count)
-        return variance.squareRoot()
     }
 }
