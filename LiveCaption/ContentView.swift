@@ -1,6 +1,36 @@
 import SwiftUI
 
+enum AppMode: String, CaseIterable, Identifiable {
+    case live = "Live"
+    case analyze = "Analyze File"
+    var id: String { rawValue }
+}
+
+/// Top-level switch between the live pipeline and the offline analysis lab.
 struct ContentView: View {
+    @State private var mode: AppMode = .live
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $mode) {
+                ForEach(AppMode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 260)
+            .padding(8)
+
+            Divider()
+
+            switch mode {
+            case .live: LiveCaptureView()
+            case .analyze: AnalysisView()
+            }
+        }
+    }
+}
+
+struct LiveCaptureView: View {
     @StateObject private var capture = CaptureManager()
 
     // Live-tunable detector settings (pushed to the detector on change).
