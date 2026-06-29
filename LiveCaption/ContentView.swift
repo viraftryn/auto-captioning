@@ -9,6 +9,7 @@ enum AppMode: String, CaseIterable, Identifiable {
 /// Top-level switch between the live pipeline and the offline analysis lab.
 struct ContentView: View {
     @State private var mode: AppMode = .live
+    @StateObject private var capture = CaptureManager()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -23,15 +24,22 @@ struct ContentView: View {
             Divider()
 
             switch mode {
-            case .live: LiveCaptureView()
+            case .live: LiveCaptureView(capture: capture)
             case .analyze: AnalysisView()
             }
+        }
+        // Own the capture lifecycle here so the camera is reliably stopped when
+        // switching to the analysis lab (onDisappear on the swapped-out branch
+        // isn't dependable).
+        .onAppear { if mode == .live { capture.start() } }
+        .onChange(of: mode) { _, newMode in
+            if newMode == .analyze { capture.stop() } else { capture.start() }
         }
     }
 }
 
 struct LiveCaptureView: View {
-    @StateObject private var capture = CaptureManager()
+    @ObservedObject var capture: CaptureManager
 
     // Live-tunable detector settings (pushed to the detector on change).
     @State private var talkThreshold: Double = 0.008
@@ -52,11 +60,9 @@ struct LiveCaptureView: View {
             speakerSidebar.frame(width: 250)
         }
         .onAppear {
-            capture.start()
             pushConfig()
             capture.setSpeechMargin(Float(speechMargin))
         }
-        .onDisappear { capture.stop() }
     }
 
     private func pushConfig() {
