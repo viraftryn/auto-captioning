@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 /// sensitivity, then compare original vs the separated target (spectrogram + A/B).
 struct AnalysisView: View {
     @StateObject private var model = AnalysisViewModel()
+    @StateObject private var transcriber = Transcriber()
     @State private var importing = false
 
     var body: some View {
@@ -69,6 +70,7 @@ struct AnalysisView: View {
                     spectrogram(model.separating ? "Separated · computing…" : "Separated · Speaker \(model.target)",
                                 model.separatedSpectrogram)
                     playback
+                    transcriptSection
                 }
             }
             .padding(.vertical, 4)
@@ -128,6 +130,50 @@ struct AnalysisView: View {
             Spacer()
         }
         .controlSize(.large)
+    }
+
+    private var transcriptSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider().padding(.vertical, 4)
+            HStack(spacing: 10) {
+                Button { Task { await transcriber.transcribe(model.originalAudio) } } label: {
+                    Label("Transcribe original (Indonesian)", systemImage: "text.bubble")
+                }
+                .controlSize(.large)
+                .disabled(transcriber.isBusy || model.originalAudio.isEmpty)
+
+                switch transcriber.status {
+                case .loadingModel:
+                    ProgressView().controlSize(.small)
+                    Text("Loading model…").font(.caption).foregroundStyle(.secondary)
+                case .transcribing:
+                    ProgressView().controlSize(.small)
+                    Text("Transcribing…").font(.caption).foregroundStyle(.secondary)
+                case .failed(let message):
+                    Text(message).font(.caption).foregroundStyle(.red).lineLimit(2)
+                default:
+                    EmptyView()
+                }
+                Spacer()
+            }
+
+            if !transcriber.segments.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(transcriber.segments) { seg in
+                        HStack(alignment: .top, spacing: 8) {
+                            Text(String(format: "%.1f–%.1f", seg.start, seg.end))
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 92, alignment: .leading)
+                            Text(seg.text).font(.callout).textSelection(.enabled)
+                        }
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.gray.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
     }
 
     private func spectrogram(_ title: String, _ image: NSImage?) -> some View {
@@ -272,6 +318,8 @@ final class AnalysisViewModel: ObservableObject {
     func playOriginal() { player.play(audio) }
     func playSeparated() { if !separated.isEmpty { player.play(separated) } }
     func stop() { player.stop() }
+
+    var originalAudio: [Float] { audio }
 
     private static func soloAudio(for speaker: Int, audio: [Float],
                                   timeline: VideoAnalyzer.Timeline, threshold: Double, sr: Double) -> [Float] {
