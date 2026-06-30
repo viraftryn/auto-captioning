@@ -1,7 +1,45 @@
 import SwiftUI
 
+enum AppMode: String, CaseIterable, Identifiable {
+    case live = "Live"
+    case analyze = "Analyze File"
+    var id: String { rawValue }
+}
+
+/// Top-level switch between the live pipeline and the offline analysis lab.
 struct ContentView: View {
+    @State private var mode: AppMode = .live
     @StateObject private var capture = CaptureManager()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $mode) {
+                ForEach(AppMode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 260)
+            .padding(8)
+
+            Divider()
+
+            switch mode {
+            case .live: LiveCaptureView(capture: capture)
+            case .analyze: AnalysisView()
+            }
+        }
+        // Own the capture lifecycle here so the camera is reliably stopped when
+        // switching to the analysis lab (onDisappear on the swapped-out branch
+        // isn't dependable).
+        .onAppear { if mode == .live { capture.start() } }
+        .onChange(of: mode) { _, newMode in
+            if newMode == .analyze { capture.stop() } else { capture.start() }
+        }
+    }
+}
+
+struct LiveCaptureView: View {
+    @ObservedObject var capture: CaptureManager
 
     // Live-tunable detector settings (pushed to the detector on change).
     @State private var talkThreshold: Double = 0.008
@@ -22,11 +60,9 @@ struct ContentView: View {
             speakerSidebar.frame(width: 250)
         }
         .onAppear {
-            capture.start()
             pushConfig()
             capture.setSpeechMargin(Float(speechMargin))
         }
-        .onDisappear { capture.stop() }
     }
 
     private func pushConfig() {
