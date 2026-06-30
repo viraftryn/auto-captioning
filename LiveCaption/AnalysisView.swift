@@ -136,7 +136,12 @@ struct AnalysisView: View {
         VStack(alignment: .leading, spacing: 8) {
             Divider().padding(.vertical, 4)
             HStack(spacing: 10) {
-                Button { Task { await transcriber.transcribe(model.originalAudio) } } label: {
+                Button {
+                    Task {
+                        await transcriber.transcribe(model.originalAudio)
+                        model.buildAttribution(from: transcriber.allWords)
+                    }
+                } label: {
                     Label("Transcribe original (Indonesian)", systemImage: "text.bubble")
                 }
                 .controlSize(.large)
@@ -157,15 +162,19 @@ struct AnalysisView: View {
                 Spacer()
             }
 
-            if !transcriber.segments.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(transcriber.segments) { seg in
+            if !model.attributedTranscript.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(model.attributedTranscript) { utterance in
                         HStack(alignment: .top, spacing: 8) {
-                            Text(String(format: "%.1f–%.1f", seg.start, seg.end))
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .frame(width: 92, alignment: .leading)
-                            Text(seg.text).font(.callout).textSelection(.enabled)
+                            Text(utterance.speaker != nil ? "Speaker \(utterance.speaker!)" : "?")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 7).padding(.vertical, 3)
+                                .background(speakerColor(utterance.speaker), in: Capsule())
+                                .foregroundStyle(.white)
+                            Text(utterance.text).font(.callout).textSelection(.enabled)
+                            Spacer()
+                            Text(String(format: "%.1f", utterance.start))
+                                .font(.caption2.monospaced()).foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -188,6 +197,12 @@ struct AnalysisView: View {
             .clipShape(RoundedRectangle(cornerRadius: 6))
         }
     }
+
+    private func speakerColor(_ id: Int?) -> Color {
+        guard let id else { return .gray }
+        let palette: [Color] = [.blue, .green, .orange, .purple, .pink, .teal]
+        return palette[(id - 1) % palette.count]
+    }
 }
 
 /// Orchestrates the offline pipeline off the main thread.
@@ -206,6 +221,7 @@ final class AnalysisViewModel: ObservableObject {
     @Published var target: Int = 0 { didSet { if oldValue != target { recompute() } } }
     @Published var sensitivity: Double = 0.005
     @Published var alwaysMask: Bool = false
+    @Published private(set) var attributedTranscript: [AttributedUtterance] = []
 
     let player = AudioPlayer()
     private let engine = SeparationEngine()
@@ -239,6 +255,7 @@ final class AnalysisViewModel: ObservableObject {
         separatedSpectrogram = nil
         separated = []
         speakers = []
+        attributedTranscript = []
         f0Threshold = nil
         let accessing = url.startAccessingSecurityScopedResource()
 
@@ -320,6 +337,10 @@ final class AnalysisViewModel: ObservableObject {
     func stop() { player.stop() }
 
     var originalAudio: [Float] { audio }
+
+    func buildAttribution(from words: [TranscriptWord]) {
+        attributedTranscript = Attribution.attribute(words: words, timeline: timeline, threshold: sensitivity)
+    }
 
     private static func soloAudio(for speaker: Int, audio: [Float],
                                   timeline: VideoAnalyzer.Timeline, threshold: Double, sr: Double) -> [Float] {

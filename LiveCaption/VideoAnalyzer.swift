@@ -34,6 +34,14 @@ enum VideoAnalyzer {
             return total
         }
 
+        /// The single most-active face at time `t` (above `threshold`), for
+        /// attributing a transcribed word to a speaker.
+        func dominantSpeaker(at t: Double, threshold: Double) -> Int? {
+            guard let frame = nearestFrame(t) else { return nil }
+            let best = frame.activity.filter { $0.value >= threshold }.max { $0.value < $1.value }
+            return best?.key
+        }
+
         private func nearestFrame(_ t: Double) -> Frame? {
             guard !frames.isEmpty else { return nil }
             if t <= frames[0].t { return frames[0] }
