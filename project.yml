@@ -26,7 +26,15 @@ targets:
     type: application
     platform: macOS
     sources:
-      - LiveCaption
+      - path: LiveCaption
+        excludes:
+          - "Models"
+          - "Models/**"
+      # The CoreML model is bundled as an opaque folder reference (copied as-is,
+      # not compiled by Xcode) so SepFormerSeparator can compile it at runtime —
+      # this keeps the app building before convert_sepformer.py has produced it.
+      - path: LiveCaption/Models
+        type: folder
     dependencies:
       - package: WhisperKit
         product: WhisperKit

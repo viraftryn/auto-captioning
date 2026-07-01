@@ -10,3 +10,8 @@ xcuserdata/
 
 # XcodeGen output (regenerate with `xcodegen generate`)
 *.xcodeproj/
+
+# CoreML model — large, regenerated via tools/sepformer/convert_sepformer.py.
+# (To commit it instead, set up git-lfs; see LiveCaption/Models/README.md.)
+LiveCaption/Models/*.mlpackage/
+*.mlmodelc/

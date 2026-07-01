@@ -1,0 +1,14 @@
+# Python deps for converting speechbrain/sepformer-whamr16k -> CoreML.
+# Use a dedicated venv (see README.md). CPU-only torch is fine; we only trace.
+#
+# coremltools historically lags the newest torch. If `convert` errors with a
+# "torch X not supported" message, pin torch/torchaudio down to the version the
+# installed coremltools advertises support for, then reinstall.
+
+torch==2.3.1
+torchaudio==2.3.1
+speechbrain==1.0.2
+coremltools==8.3
+numpy==1.26.4
+soundfile==0.12.1
+huggingface_hub==0.34.6
