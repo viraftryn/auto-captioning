@@ -18,6 +18,10 @@ final class AnalysisViewModel: ObservableObject {
     @Published var target: Int = 0 { didSet { if oldValue != target { recompute() } } }
     @Published var sensitivity: Double = 0.005
     @Published var gateToTarget: Bool = true
+    /// Manual correction: SepFormer's stream order is arbitrary and the cross-modal
+    /// match can occasionally pair a stream with the wrong face. Flip this when the
+    /// separated audio for one speaker is actually the other person's voice.
+    @Published var swapSpeakers = false { didSet { if oldValue != swapSpeakers { onSwapChanged() } } }
     @Published private(set) var attributedTranscript: [AttributedUtterance] = []
 
     let player = AudioPlayer()
@@ -27,6 +31,7 @@ final class AnalysisViewModel: ObservableObject {
     private var audio: [Float] = []
     private var separated: [Float] = []
     private var separatedStreams: [[Float]] = []
+    private var assignment: [Int?] = []               // raw stream index → speaker id (pre-swap)
     private var streamForSpeaker: [Int: [Float]] = [:]
     private var separator: SepFormerSeparator?
     private var timeline = VideoAnalyzer.Timeline(frames: [], speakerIDs: [], thumbnails: [:])
@@ -43,7 +48,9 @@ final class AnalysisViewModel: ObservableObject {
         separatedSpectrogram = nil
         separated = []
         separatedStreams = []
+        assignment = []
         streamForSpeaker = [:]
+        swapSpeakers = false
         speakers = []
         attributedTranscript = []
         separationError = nil
@@ -99,12 +106,11 @@ final class AnalysisViewModel: ObservableObject {
             do {
                 let streams = try sep.separate(audioBuf)
                 let mapping = SourceAssignment.assign(streams: streams, timeline: tl, sampleRate: sr)
-                var bySpeaker: [Int: [Float]] = [:]
-                for (i, spk) in mapping.enumerated() { if let spk { bySpeaker[spk] = streams[i] } }
                 DispatchQueue.main.async {
                     self.separator = sep
                     self.separatedStreams = streams
-                    self.streamForSpeaker = bySpeaker
+                    self.assignment = mapping
+                    self.applyAssignment()
                     self.separating = false
                     self.refreshTarget()
                 }
@@ -152,6 +158,41 @@ final class AnalysisViewModel: ObservableObject {
                 self.separatedSpectrogram = image
                 self.separating = false
             }
+        }
+    }
+
+    /// Whether two streams were matched to two faces (so a swap is meaningful).
+    var canSwap: Bool { assignment.compactMap { $0 }.count == 2 }
+
+    /// Rebuild `streamForSpeaker` from the raw assignment, applying the manual swap.
+    private func applyAssignment() {
+        var map = assignment
+        if swapSpeakers, map.count == 2 { map.swapAt(0, 1) }
+        var bySpeaker: [Int: [Float]] = [:]
+        for (i, spk) in map.enumerated() where i < separatedStreams.count {
+            if let spk { bySpeaker[spk] = separatedStreams[i] }
+        }
+        streamForSpeaker = bySpeaker
+    }
+
+    /// React to the swap toggle: re-pick each speaker's stream, relabel any existing
+    /// transcript, and re-render — no SepFormer or Whisper re-run needed.
+    private func onSwapChanged() {
+        applyAssignment()
+        swapTranscriptLabels()
+        refreshTarget()
+    }
+
+    /// Swapping only exchanges the two speaker labels (each stream's audio is
+    /// unchanged), so relabel an existing transcript in place rather than re-running
+    /// Whisper.
+    private func swapTranscriptLabels() {
+        let ids = assignment.compactMap { $0 }
+        guard ids.count == 2, !attributedTranscript.isEmpty else { return }
+        let (a, b) = (ids[0], ids[1])
+        attributedTranscript = attributedTranscript.map {
+            let s = $0.speaker == a ? b : ($0.speaker == b ? a : $0.speaker)
+            return AttributedUtterance(speaker: s, text: $0.text, start: $0.start, end: $0.end)
         }
     }
 

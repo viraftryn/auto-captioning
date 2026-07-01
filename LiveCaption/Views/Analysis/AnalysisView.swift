@@ -108,6 +108,11 @@ struct AnalysisView: View {
             Toggle("Silence the target when their lips aren't moving", isOn: $model.gateToTarget)
                 .font(.caption)
                 .onChange(of: model.gateToTarget) { model.recompute() }
+            if model.canSwap {
+                Toggle("Swap the two separated voices (fix Speaker 1 ⇄ 2 if they're reversed)",
+                       isOn: $model.swapSpeakers)
+                    .font(.caption)
+            }
         }
     }
 

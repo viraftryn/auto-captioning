@@ -38,25 +38,41 @@ enum SourceAssignment {
             }
         }
 
-        // Greedy maximum assignment: repeatedly take the best remaining
-        // (stream, speaker) pair. For 2 streams this is equivalent to choosing the
-        // better of the two permutations; for >2 faces it assigns each of the 2
-        // streams to its most-correlated face and leaves the rest unmatched.
-        var result = [Int?](repeating: nil, count: streams.count)
-        var usedStreams = Set<Int>(), usedFaces = Set<Int>()
-        for _ in 0..<min(streams.count, speakers.count) {
-            var best: (i: Int, j: Int, v: Float)?
-            for i in streamEnv.indices where !usedStreams.contains(i) {
-                for j in speakers.indices where !usedFaces.contains(j) {
-                    if best == nil || corr[i][j] > best!.v { best = (i, j, corr[i][j]) }
-                }
+        // Assign a DISTINCT face to each stream maximising the *total* correlation.
+        // A greedy pick-the-best-pair-first can lock in a locally-best pair that
+        // forces the other stream onto the wrong face (→ swapped speakers); the
+        // globally-best pairing avoids that and is cheap here (2 streams).
+        return bestAssignment(corr, speakers: speakers)
+    }
+
+    /// Injective stream→face assignment (a distinct face per stream) that maximises
+    /// the summed correlation. Any streams beyond the number of faces get `nil`.
+    /// Exhaustive, but the counts are tiny (2 streams; a handful of faces).
+    private static func bestAssignment(_ corr: [[Float]], speakers: [Int]) -> [Int?] {
+        let streamCount = corr.count
+        let faceCount = speakers.count
+        var current = [Int](repeating: -1, count: streamCount)
+        var used = [Bool](repeating: false, count: faceCount)
+        var best: (score: Float, pick: [Int])?
+
+        func search(_ s: Int, _ score: Float) {
+            if s == streamCount {
+                if best == nil || score > best!.score { best = (score, current) }
+                return
             }
-            guard let pick = best else { break }
-            result[pick.i] = speakers[pick.j]
-            usedStreams.insert(pick.i)
-            usedFaces.insert(pick.j)
+            var placed = false
+            for j in 0..<faceCount where !used[j] {
+                used[j] = true; current[s] = j
+                search(s + 1, score + corr[s][j])
+                used[j] = false; current[s] = -1
+                placed = true
+            }
+            if !placed { search(s + 1, score) }   // more streams than faces → leave nil
         }
-        return result
+        search(0, 0)
+
+        guard let best else { return Array(repeating: nil, count: streamCount) }
+        return best.pick.map { $0 >= 0 ? speakers[$0] : nil }
     }
 
     /// RMS energy of `signal` in a ±25 ms window centred on each video frame time.
