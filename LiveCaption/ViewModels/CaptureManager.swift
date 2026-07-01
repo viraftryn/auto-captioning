@@ -40,7 +40,13 @@ final class CaptureManager: NSObject, ObservableObject {
     private let faceProcessor = FaceLandmarkProcessor()
     private let detector = LipActivityDetector()
     private let vad = VoiceActivityDetector()
+    private let resampler = AudioResampler()
     private var isConfigured = false
+
+    /// Live transcription pipeline (chunking → Whisper → speaker-attributed
+    /// transcript). Fed 16 kHz PCM from the audio path and lip activity from the
+    /// video path; the UI observes it directly.
+    let live = LiveCaptionEngine()
 
     // Latest evidence for cross-modal overlap (main-thread only).
     private var lastVisualOverlap = false
@@ -70,6 +76,7 @@ final class CaptureManager: NSObject, ObservableObject {
                 DispatchQueue.main.async {
                     self.isRunning = true
                     self.statusMessage = microphone ? "Running" : "Running (no mic access)"
+                    self.live.start()
                 }
             }
         }
@@ -83,6 +90,7 @@ final class CaptureManager: NSObject, ObservableObject {
         audioQueue.async { self.vad.reset() }
         DispatchQueue.main.async {
             self.isRunning = false
+            self.live.stop()
             self.audioLevel = 0
             self.audioSpeechActive = false
             self.speechLevel = 0
@@ -221,6 +229,12 @@ extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate,
             let result = self.detector.update(observations: observations,
                                                imageSize: imageSize,
                                                now: now)
+
+            // Feed the live transcriber this frame's per-speaker lip activity, used
+            // to attribute each transcribed chunk to a speaker.
+            let activity = Dictionary(uniqueKeysWithValues: result.faces.map { ($0.id, $0.activity) })
+            self.live.ingestActivity(activity, overlap: result.overlap, now: now)
+
             DispatchQueue.main.async {
                 self.trackedFaces = result.faces
                 self.faceCount = result.faces.count
@@ -234,14 +248,21 @@ extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate,
     }
 
     private func handleAudio(_ sampleBuffer: CMSampleBuffer) {
+        let now = CACurrentMediaTime()
         guard let meanSquare = AudioMetrics.meanSquare(of: sampleBuffer) else { return }
-        vad.process(meanSquare: meanSquare, now: CACurrentMediaTime())
+        vad.process(meanSquare: meanSquare, now: now)
 
         let speech = vad.isSpeech
         let speechLvl = vad.speechLevel
         let energyDB = vad.energyDB
         let floorDB = vad.noiseFloorDB
         let linear = vad.linearLevel
+
+        // Feed 16 kHz mono PCM + the VAD decision to the live transcriber, which
+        // segments the stream into chunks and transcribes them.
+        let samples = resampler.resample(sampleBuffer)
+        if !samples.isEmpty { live.ingestAudio(samples, now: now, isSpeech: speech) }
+
         DispatchQueue.main.async {
             self.audioLevel = min(1, linear * 12)
             self.audioSpeechActive = speech
