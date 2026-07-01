@@ -39,7 +39,17 @@ struct LiveTranscriptView: View {
             } else if let error = engine.errorText {
                 Text(error).font(.caption).foregroundStyle(.red).lineLimit(1)
             }
+
             Spacer()
+
+            if engine.separationUnavailable {
+                Label("overlap model missing", systemImage: "cpu")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("Overlapping speech was detected, but the SepFormer model isn't installed. "
+                          + "Run tools/sepformer/convert_sepformer.py and rebuild; until then overlaps "
+                          + "fall back to single-speaker.")
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)

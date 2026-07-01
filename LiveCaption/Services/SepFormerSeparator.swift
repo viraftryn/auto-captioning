@@ -132,6 +132,27 @@ final class SepFormerSeparator {
         return out
     }
 
+    /// Separate a single short clip in **one** model pass — the live path.
+    ///
+    /// The live segmenter caps chunks at (just under) the window length, so unlike
+    /// `separate` there's no windowing/OLA/permutation stitching: we zero-pad to
+    /// `windowLength`, run one inference, and trim the padding back off. A clip
+    /// longer than the window (a rare near-cap chunk) falls back to `separate`.
+    func separateWindow(_ audio: [Float]) throws -> [[Float]] {
+        let n = audio.count
+        guard n > 0 else { return Array(repeating: [], count: sourceCount) }
+        guard n <= windowLength else { return try separate(audio) }
+
+        var window = [Float](repeating: 0, count: windowLength)
+        window.withUnsafeMutableBufferPointer { dst in
+            audio.withUnsafeBufferPointer { src in
+                dst.baseAddress!.update(from: src.baseAddress!, count: n)
+            }
+        }
+        let streams = try infer(window)
+        return streams.map { Array($0.prefix(n)) }
+    }
+
     /// Should the current window's two streams be swapped to match the previous
     /// window? Compares each window's leading overlap region (same time span) by
     /// normalised cross-correlation and picks the higher-scoring pairing.
