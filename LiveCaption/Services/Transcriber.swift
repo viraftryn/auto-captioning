@@ -17,12 +17,51 @@ struct TranscriptSegment: Identifiable {
     let words: [TranscriptWord]
 }
 
-/// Wraps WhisperKit (CoreML + Neural Engine). Loads a Whisper model on first use
-/// and transcribes an in-memory 16 kHz mono buffer to timestamped segments.
+/// Selectable Whisper model size. Each case maps to a folder in WhisperKit's
+/// default CoreML model repo (`argmaxinc/whisperkit-coreml`), downloaded and
+/// cached on first use. Bigger = more accurate but slower and a larger download.
+enum WhisperModelSize: String, CaseIterable, Identifiable {
+    case base, small, medium, large
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .base:   return "Base"
+        case .small:  return "Small"
+        case .medium: return "Medium"
+        case .large:  return "Large"
+        }
+    }
+
+    /// Model folder name in the WhisperKit repo.
+    var repoName: String {
+        switch self {
+        case .base:   return "openai_whisper-base"
+        case .small:  return "openai_whisper-small"
+        case .medium: return "openai_whisper-medium"
+        case .large:  return "openai_whisper-large-v3"
+        }
+    }
+
+    /// Speed/accuracy hint shown next to the picker.
+    var hint: String {
+        switch self {
+        case .base:   return "fastest · lowest accuracy"
+        case .small:  return "balanced"
+        case .medium: return "slower · higher accuracy"
+        case .large:  return "slowest · best accuracy · large download"
+        }
+    }
+}
+
+/// Wraps WhisperKit (CoreML + Neural Engine). Loads the selected Whisper model on
+/// first use (and reloads when the size changes), then transcribes an in-memory
+/// 16 kHz mono buffer to timestamped segments — language forced to Indonesian by
+/// default.
 ///
-/// Defaults to a stock multilingual model with language forced to Indonesian.
-/// To use a fine-tuned `whisper-*-id` model, convert it to CoreML with
-/// whisperkittools and pass its folder name / path as `modelName`.
+/// In the Analyze-File pipeline this runs **per separated stream**: SepFormer
+/// splits the mixture into one clean waveform per speaker, and each is transcribed
+/// on its own, so the resulting words already belong to a known speaker.
 @MainActor
 final class Transcriber: ObservableObject {
     enum Status: Equatable {
@@ -31,13 +70,16 @@ final class Transcriber: ObservableObject {
     }
 
     @Published private(set) var status: Status = .idle
-    @Published private(set) var segments: [TranscriptSegment] = []
+    /// Changing size drops the cached pipeline so the next transcribe reloads it.
+    @Published var model: WhisperModelSize {
+        didSet { if oldValue != model { pipe = nil; loaded = nil } }
+    }
 
     private var pipe: WhisperKit?
-    private let modelName: String
+    private var loaded: WhisperModelSize?
 
-    init(modelName: String = "openai_whisper-small") {
-        self.modelName = modelName
+    init(model: WhisperModelSize = .small) {
+        self.model = model
     }
 
     var isBusy: Bool {
@@ -47,23 +89,24 @@ final class Transcriber: ObservableObject {
         }
     }
 
-    var allWords: [TranscriptWord] { segments.flatMap(\.words) }
-
-    func transcribe(_ samples: [Float], language: String = "id") async {
-        guard !samples.isEmpty else { return }
-        segments = []
+    /// Transcribe one buffer and return its cleaned segments. Reloads the
+    /// WhisperKit pipeline first if the selected model changed since the last run.
+    /// Returns an empty array on empty input or failure (see `status`).
+    func transcribe(_ samples: [Float], language: String = "id") async -> [TranscriptSegment] {
+        guard !samples.isEmpty else { return [] }
         do {
-            if pipe == nil {
+            if pipe == nil || loaded != model {
                 status = .loadingModel
-                pipe = try await WhisperKit(WhisperKitConfig(model: modelName))
+                pipe = try await WhisperKit(WhisperKitConfig(model: model.repoName))
+                loaded = model
             }
-            guard let pipe else { return }
+            guard let pipe else { return [] }
 
             status = .transcribing
             let options = DecodingOptions(language: language, wordTimestamps: true)
             let results = try await pipe.transcribe(audioArray: samples, decodeOptions: options)
 
-            segments = results.flatMap(\.segments).compactMap { segment -> TranscriptSegment? in
+            let segments = results.flatMap(\.segments).compactMap { segment -> TranscriptSegment? in
                 let text = Self.clean(segment.text)
                 guard !text.isEmpty else { return nil }
                 var words = (segment.words ?? []).compactMap { word -> TranscriptWord? in
@@ -78,8 +121,10 @@ final class Transcriber: ObservableObject {
                                          text: text, words: words)
             }
             status = .ready
+            return segments
         } catch {
             status = .failed(error.localizedDescription)
+            return []
         }
     }
 

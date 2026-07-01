@@ -161,8 +161,44 @@ final class AnalysisViewModel: ObservableObject {
 
     var originalAudio: [Float] { audio }
 
-    func buildAttribution(from words: [TranscriptWord]) {
-        attributedTranscript = Attribution.attribute(words: words, timeline: timeline, threshold: sensitivity)
+    /// True once SepFormer has produced at least one speaker-matched stream, i.e.
+    /// there is clean per-speaker audio to transcribe.
+    var canTranscribe: Bool { !streamForSpeaker.isEmpty }
+
+    /// The separated streams to transcribe — one per matched speaker, in speaker-id
+    /// order, each optionally gated to that speaker's own lip activity so residual
+    /// cross-talk is dropped before Whisper sees it.
+    func streamsForTranscription() -> [(speaker: Int, samples: [Float])] {
+        let gateOn = gateToTarget
+        let tl = timeline
+        let sr = self.sr
+        let threshold = sensitivity
+        return streamForSpeaker.sorted { $0.key < $1.key }.map { spk, stream in
+            (spk, gateOn ? Self.gate(stream, target: spk, timeline: tl, threshold: threshold, sr: sr) : stream)
+        }
+    }
+
+    /// Build the speaker-attributed transcript from the per-stream transcriptions.
+    /// Because each stream is already one separated speaker (SepFormer + active-
+    /// speaker assignment did the attribution), we just tag every segment with its
+    /// stream's speaker, order the combined transcript by time, and merge adjacent
+    /// same-speaker runs into one line.
+    func setPerSpeakerTranscript(_ perSpeaker: [(speaker: Int, segments: [TranscriptSegment])]) {
+        var utterances: [AttributedUtterance] = perSpeaker.flatMap { speaker, segs in
+            segs.map { AttributedUtterance(speaker: speaker, text: $0.text, start: $0.start, end: $0.end) }
+        }
+        utterances.sort { $0.start < $1.start }
+
+        var merged: [AttributedUtterance] = []
+        for u in utterances {
+            if let last = merged.last, last.speaker == u.speaker {
+                merged[merged.count - 1] = AttributedUtterance(
+                    speaker: u.speaker, text: last.text + " " + u.text, start: last.start, end: u.end)
+            } else {
+                merged.append(u)
+            }
+        }
+        attributedTranscript = merged
     }
 
     private static func gate(_ stream: [Float], target: Int,
