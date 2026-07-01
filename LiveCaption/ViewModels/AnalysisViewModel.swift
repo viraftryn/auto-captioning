@@ -18,6 +18,10 @@ final class AnalysisViewModel: ObservableObject {
     @Published var target: Int = 0 { didSet { if oldValue != target { recompute() } } }
     @Published var sensitivity: Double = 0.005
     @Published var gateToTarget: Bool = true
+    /// Manual correction: SepFormer's stream order is arbitrary and the cross-modal
+    /// match can occasionally pair a stream with the wrong face. Flip this when the
+    /// separated audio for one speaker is actually the other person's voice.
+    @Published var swapSpeakers = false { didSet { if oldValue != swapSpeakers { onSwapChanged() } } }
     @Published private(set) var attributedTranscript: [AttributedUtterance] = []
 
     let player = AudioPlayer()
@@ -27,6 +31,7 @@ final class AnalysisViewModel: ObservableObject {
     private var audio: [Float] = []
     private var separated: [Float] = []
     private var separatedStreams: [[Float]] = []
+    private var assignment: [Int?] = []               // raw stream index → speaker id (pre-swap)
     private var streamForSpeaker: [Int: [Float]] = [:]
     private var separator: SepFormerSeparator?
     private var timeline = VideoAnalyzer.Timeline(frames: [], speakerIDs: [], thumbnails: [:])
@@ -43,7 +48,9 @@ final class AnalysisViewModel: ObservableObject {
         separatedSpectrogram = nil
         separated = []
         separatedStreams = []
+        assignment = []
         streamForSpeaker = [:]
+        swapSpeakers = false
         speakers = []
         attributedTranscript = []
         separationError = nil
@@ -99,12 +106,11 @@ final class AnalysisViewModel: ObservableObject {
             do {
                 let streams = try sep.separate(audioBuf)
                 let mapping = SourceAssignment.assign(streams: streams, timeline: tl, sampleRate: sr)
-                var bySpeaker: [Int: [Float]] = [:]
-                for (i, spk) in mapping.enumerated() { if let spk { bySpeaker[spk] = streams[i] } }
                 DispatchQueue.main.async {
                     self.separator = sep
                     self.separatedStreams = streams
-                    self.streamForSpeaker = bySpeaker
+                    self.assignment = mapping
+                    self.applyAssignment()
                     self.separating = false
                     self.refreshTarget()
                 }
@@ -155,14 +161,85 @@ final class AnalysisViewModel: ObservableObject {
         }
     }
 
+    /// Whether two streams were matched to two faces (so a swap is meaningful).
+    var canSwap: Bool { assignment.compactMap { $0 }.count == 2 }
+
+    /// Rebuild `streamForSpeaker` from the raw assignment, applying the manual swap.
+    private func applyAssignment() {
+        var map = assignment
+        if swapSpeakers, map.count == 2 { map.swapAt(0, 1) }
+        var bySpeaker: [Int: [Float]] = [:]
+        for (i, spk) in map.enumerated() where i < separatedStreams.count {
+            if let spk { bySpeaker[spk] = separatedStreams[i] }
+        }
+        streamForSpeaker = bySpeaker
+    }
+
+    /// React to the swap toggle: re-pick each speaker's stream, relabel any existing
+    /// transcript, and re-render — no SepFormer or Whisper re-run needed.
+    private func onSwapChanged() {
+        applyAssignment()
+        swapTranscriptLabels()
+        refreshTarget()
+    }
+
+    /// Swapping only exchanges the two speaker labels (each stream's audio is
+    /// unchanged), so relabel an existing transcript in place rather than re-running
+    /// Whisper.
+    private func swapTranscriptLabels() {
+        let ids = assignment.compactMap { $0 }
+        guard ids.count == 2, !attributedTranscript.isEmpty else { return }
+        let (a, b) = (ids[0], ids[1])
+        attributedTranscript = attributedTranscript.map {
+            let s = $0.speaker == a ? b : ($0.speaker == b ? a : $0.speaker)
+            return AttributedUtterance(speaker: s, text: $0.text, start: $0.start, end: $0.end)
+        }
+    }
+
     func playOriginal() { player.play(audio) }
     func playSeparated() { if !separated.isEmpty { player.play(separated) } }
     func stop() { player.stop() }
 
     var originalAudio: [Float] { audio }
 
-    func buildAttribution(from words: [TranscriptWord]) {
-        attributedTranscript = Attribution.attribute(words: words, timeline: timeline, threshold: sensitivity)
+    /// True once SepFormer has produced at least one speaker-matched stream, i.e.
+    /// there is clean per-speaker audio to transcribe.
+    var canTranscribe: Bool { !streamForSpeaker.isEmpty }
+
+    /// The separated streams to transcribe — one per matched speaker, in speaker-id
+    /// order, each optionally gated to that speaker's own lip activity so residual
+    /// cross-talk is dropped before Whisper sees it.
+    func streamsForTranscription() -> [(speaker: Int, samples: [Float])] {
+        let gateOn = gateToTarget
+        let tl = timeline
+        let sr = self.sr
+        let threshold = sensitivity
+        return streamForSpeaker.sorted { $0.key < $1.key }.map { spk, stream in
+            (spk, gateOn ? Self.gate(stream, target: spk, timeline: tl, threshold: threshold, sr: sr) : stream)
+        }
+    }
+
+    /// Build the speaker-attributed transcript from the per-stream transcriptions.
+    /// Because each stream is already one separated speaker (SepFormer + active-
+    /// speaker assignment did the attribution), we just tag every segment with its
+    /// stream's speaker, order the combined transcript by time, and merge adjacent
+    /// same-speaker runs into one line.
+    func setPerSpeakerTranscript(_ perSpeaker: [(speaker: Int, segments: [TranscriptSegment])]) {
+        var utterances: [AttributedUtterance] = perSpeaker.flatMap { speaker, segs in
+            segs.map { AttributedUtterance(speaker: speaker, text: $0.text, start: $0.start, end: $0.end) }
+        }
+        utterances.sort { $0.start < $1.start }
+
+        var merged: [AttributedUtterance] = []
+        for u in utterances {
+            if let last = merged.last, last.speaker == u.speaker {
+                merged[merged.count - 1] = AttributedUtterance(
+                    speaker: u.speaker, text: last.text + " " + u.text, start: last.start, end: u.end)
+            } else {
+                merged.append(u)
+            }
+        }
+        attributedTranscript = merged
     }
 
     private static func gate(_ stream: [Float], target: Int,

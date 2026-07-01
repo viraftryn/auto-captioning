@@ -108,6 +108,11 @@ struct AnalysisView: View {
             Toggle("Silence the target when their lips aren't moving", isOn: $model.gateToTarget)
                 .font(.caption)
                 .onChange(of: model.gateToTarget) { model.recompute() }
+            if model.canSwap {
+                Toggle("Swap the two separated voices (fix Speaker 1 ⇄ 2 if they're reversed)",
+                       isOn: $model.swapSpeakers)
+                    .font(.caption)
+            }
         }
     }
 
@@ -152,15 +157,22 @@ struct AnalysisView: View {
             Divider().padding(.vertical, 4)
             HStack(spacing: 10) {
                 Button {
-                    Task {
-                        await transcriber.transcribe(model.originalAudio)
-                        model.buildAttribution(from: transcriber.allWords)
-                    }
+                    Task { await transcribeSeparated() }
                 } label: {
-                    Label("Transcribe original (Indonesian)", systemImage: "text.bubble")
+                    Label("Transcribe separated (Indonesian)", systemImage: "text.bubble")
                 }
                 .controlSize(.large)
-                .disabled(transcriber.isBusy || model.originalAudio.isEmpty)
+                .disabled(transcriber.isBusy || model.separating || !model.canTranscribe)
+
+                Picker("Model", selection: $transcriber.model) {
+                    ForEach(WhisperModelSize.allCases) { size in
+                        Text(size.displayName).tag(size)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+                .disabled(transcriber.isBusy)
 
                 switch transcriber.status {
                 case .loadingModel:
@@ -175,6 +187,14 @@ struct AnalysisView: View {
                     EmptyView()
                 }
                 Spacer()
+            }
+
+            Text("Whisper \(transcriber.model.displayName) — \(transcriber.model.hint). Transcribes each separated speaker; downloaded on first use.")
+                .font(.caption2).foregroundStyle(.secondary)
+
+            if !model.canTranscribe && model.separationError == nil && model.targetNote == nil {
+                Text("Separate the audio first — transcription runs on the clean per-speaker streams.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             if !model.attributedTranscript.isEmpty {
@@ -198,6 +218,18 @@ struct AnalysisView: View {
                 .background(Color.gray.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             }
         }
+    }
+
+    /// Transcribe every separated speaker stream in turn, then merge into one
+    /// time-ordered, speaker-attributed transcript. Each stream is one voice, so
+    /// its words are attributed by construction — no word→face guessing needed.
+    private func transcribeSeparated() async {
+        var perSpeaker: [(speaker: Int, segments: [TranscriptSegment])] = []
+        for (speaker, samples) in model.streamsForTranscription() {
+            let segments = await transcriber.transcribe(samples)
+            perSpeaker.append((speaker, segments))
+        }
+        model.setPerSpeakerTranscript(perSpeaker)
     }
 
     private func spectrogram(_ title: String, _ image: NSImage?) -> some View {
