@@ -46,7 +46,6 @@ final class LiveCaptionEngine: ObservableObject {
     /// Set once if an overlap chunk arrives but the SepFormer model isn't installed;
     /// overlaps then fall back to single-speaker until it's produced.
     @Published private(set) var separationUnavailable = false
-    @Published var model: WhisperModelSize = .small
     @Published var captioning = true { didSet { setEnabled(captioning) } }
 
     // MARK: Tuning
@@ -219,9 +218,8 @@ final class LiveCaptionEngine: ObservableObject {
 
     @MainActor
     private func process(_ chunk: AudioChunk) async {
-        if transcriber == nil { transcriber = Transcriber(model: model) }
+        if transcriber == nil { transcriber = Transcriber() }
         guard let transcriber else { return }
-        if transcriber.model != model { transcriber.model = model }
 
         isBusy = true
         defer { isBusy = false }

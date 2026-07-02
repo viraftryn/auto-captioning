@@ -164,16 +164,6 @@ struct AnalysisView: View {
                 .controlSize(.large)
                 .disabled(transcriber.isBusy || model.separating || !model.canTranscribe)
 
-                Picker("Model", selection: $transcriber.model) {
-                    ForEach(WhisperModelSize.allCases) { size in
-                        Text(size.displayName).tag(size)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .fixedSize()
-                .disabled(transcriber.isBusy)
-
                 switch transcriber.status {
                 case .loadingModel:
                     ProgressView().controlSize(.small)
@@ -189,7 +179,7 @@ struct AnalysisView: View {
                 Spacer()
             }
 
-            Text("Whisper \(transcriber.model.displayName) — \(transcriber.model.hint). Transcribes each separated speaker; downloaded on first use.")
+            Text("Whisper large-v3 — best accuracy. Transcribes each separated speaker; downloaded on first use.")
                 .font(.caption2).foregroundStyle(.secondary)
 
             if !model.canTranscribe && model.separationError == nil && model.targetNote == nil {

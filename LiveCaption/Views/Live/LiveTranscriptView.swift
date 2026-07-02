@@ -25,14 +25,6 @@ struct LiveTranscriptView: View {
                 .toggleStyle(.switch)
                 .help("Pause or resume live captions")
 
-            Picker("Model", selection: $engine.model) {
-                ForEach(WhisperModelSize.allCases) { Text($0.displayName).tag($0) }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .fixedSize()
-            .disabled(engine.isBusy)
-
             if engine.isBusy {
                 ProgressView().controlSize(.small)
                 Text("Transcribing…").font(.caption).foregroundStyle(.secondary)

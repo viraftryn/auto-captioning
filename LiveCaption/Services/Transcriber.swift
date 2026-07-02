@@ -17,46 +17,12 @@ struct TranscriptSegment: Identifiable {
     let words: [TranscriptWord]
 }
 
-/// Selectable Whisper model size. Each case maps to a folder in WhisperKit's
-/// default CoreML model repo (`argmaxinc/whisperkit-coreml`), downloaded and
-/// cached on first use. Bigger = more accurate but slower and a larger download.
-enum WhisperModelSize: String, CaseIterable, Identifiable {
-    case base, small, medium, large
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .base:   return "Base"
-        case .small:  return "Small"
-        case .medium: return "Medium"
-        case .large:  return "Large"
-        }
-    }
-
-    /// Model folder name in the WhisperKit repo.
-    var repoName: String {
-        switch self {
-        case .base:   return "openai_whisper-base"
-        case .small:  return "openai_whisper-small"
-        case .medium: return "openai_whisper-medium"
-        case .large:  return "openai_whisper-large-v3"
-        }
-    }
-
-    /// Speed/accuracy hint shown next to the picker.
-    var hint: String {
-        switch self {
-        case .base:   return "fastest · lowest accuracy"
-        case .small:  return "balanced"
-        case .medium: return "slower · higher accuracy"
-        case .large:  return "slowest · best accuracy · large download"
-        }
-    }
-}
-
-/// Wraps WhisperKit (CoreML + Neural Engine). Loads the selected Whisper model on
-/// first use (and reloads when the size changes), then transcribes an in-memory
-/// 16 kHz mono buffer to timestamped segments — language forced to Indonesian by
+/// Wraps WhisperKit (CoreML + Neural Engine). Always transcribes with Whisper
+/// `large-v3`: on the Neural Engine its inference stays fast enough for this app
+/// while giving the best accuracy, so the model is fixed rather than selectable. The
+/// model is downloaded from WhisperKit's default CoreML repo
+/// (`argmaxinc/whisperkit-coreml`) and cached on first use, then reused for every
+/// transcribe of an in-memory 16 kHz mono buffer — language forced to Indonesian by
 /// default.
 ///
 /// In the Analyze-File pipeline this runs **per separated stream**: SepFormer
@@ -69,18 +35,11 @@ final class Transcriber: ObservableObject {
         case failed(String)
     }
 
+    /// WhisperKit model folder in the `argmaxinc/whisperkit-coreml` repo.
+    static let modelRepo = "openai_whisper-large-v3"
+
     @Published private(set) var status: Status = .idle
-    /// Changing size drops the cached pipeline so the next transcribe reloads it.
-    @Published var model: WhisperModelSize {
-        didSet { if oldValue != model { pipe = nil; loaded = nil } }
-    }
-
     private var pipe: WhisperKit?
-    private var loaded: WhisperModelSize?
-
-    init(model: WhisperModelSize = .small) {
-        self.model = model
-    }
 
     var isBusy: Bool {
         switch status {
@@ -89,16 +48,15 @@ final class Transcriber: ObservableObject {
         }
     }
 
-    /// Transcribe one buffer and return its cleaned segments. Reloads the
-    /// WhisperKit pipeline first if the selected model changed since the last run.
-    /// Returns an empty array on empty input or failure (see `status`).
+    /// Transcribe one buffer and return its cleaned segments. Loads the WhisperKit
+    /// pipeline on first use. Returns an empty array on empty input or failure (see
+    /// `status`).
     func transcribe(_ samples: [Float], language: String = "id") async -> [TranscriptSegment] {
         guard !samples.isEmpty else { return [] }
         do {
-            if pipe == nil || loaded != model {
+            if pipe == nil {
                 status = .loadingModel
-                pipe = try await WhisperKit(WhisperKitConfig(model: model.repoName))
-                loaded = model
+                pipe = try await WhisperKit(WhisperKitConfig(model: Self.modelRepo))
             }
             guard let pipe else { return [] }
 
