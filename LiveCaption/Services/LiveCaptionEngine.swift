@@ -71,9 +71,6 @@ final class LiveCaptionEngine: ObservableObject {
     /// The winning face must beat the runner-up by this much, else it's a near-tie
     /// and we defer to the previous speaker (stickiness) instead of guessing.
     private let attrMargin: Float = 0.12
-    /// Minimum separation-assignment confidence to trust the overlap split; below
-    /// it we skip the two-speaker path and attribute the chunk as a single speaker.
-    private let overlapConfidence: Float = 0.10
 
     // MARK: Segmenter state (segmentQueue only)
     private let segmentQueue = DispatchQueue(label: "com.aiml.livecaption.segment", qos: .userInitiated)
@@ -246,16 +243,8 @@ final class LiveCaptionEngine: ObservableObject {
         if chunk.sawOverlap {
             do {
                 let streams = try await sepRunner.separate(chunk.samples)
-                let resolved = SourceAssignment.resolve(streams: streams,
-                                                        timeline: Self.miniTimeline(from: chunk),
-                                                        sampleRate: sr)
-                // Only take the two-speaker path when the split matched two faces
-                // clearly better one way than swapped; a near-tie means we'd be
-                // guessing which stream is whom, so fall back to single-speaker.
-                if resolved.confidence >= overlapConfidence,
-                   await transcribeOverlap(chunk, streams: streams, mapping: resolved.mapping,
-                                           using: transcriber) { return }
-                // Low-confidence split or no usable text → fall through to single-speaker.
+                if await transcribeOverlap(chunk, streams: streams, using: transcriber) { return }
+                // No stream produced usable text → fall through to single-speaker.
             } catch let e as SepFormerSeparator.SeparationError {
                 if case .modelMissing = e { separationUnavailable = true }
                 else { errorText = e.errorDescription }
@@ -284,9 +273,11 @@ final class LiveCaptionEngine: ObservableObject {
     /// own, and emit one attributed line per speaker. Returns whether it produced
     /// any text (so the caller can fall back to single-speaker if not).
     @MainActor
-    private func transcribeOverlap(_ chunk: AudioChunk, streams: [[Float]], mapping: [Int?],
+    private func transcribeOverlap(_ chunk: AudioChunk, streams: [[Float]],
                                    using transcriber: Transcriber) async -> Bool {
         separationUnavailable = false
+        let timeline = Self.miniTimeline(from: chunk)
+        let mapping = SourceAssignment.assign(streams: streams, timeline: timeline, sampleRate: sr)
 
         // Skip a near-silent stream (SepFormer emits two even when only one voice is
         // present) so Whisper doesn't hallucinate a spurious line from separation

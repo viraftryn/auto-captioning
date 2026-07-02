@@ -9,37 +9,18 @@
 /// single-speaker attribution in `LiveCaptionEngine`.
 enum SourceAssignment {
 
-    /// A stream→face assignment plus how trustworthy it is.
-    struct Assignment {
-        /// `mapping[i]` = the speaker id stream `i` best matches (or `nil` if no face
-        /// correlates / there are fewer faces than streams).
-        let mapping: [Int?]
-        /// How much the chosen pairing beats the next-best injective pairing, in
-        /// summed-correlation units. Small = the streams matched two faces almost
-        /// equally well, so the pairing (which is which) is a coin-flip — callers
-        /// should treat a low value as "don't trust this separation."
-        let confidence: Float
-    }
-
     /// Lag search width for stream↔face correlation: ±3 frames ≈ ±100 ms at 30 fps,
     /// enough to absorb audio/video capture offset without matching unrelated motion.
     private static let maxLagFrames = 3
 
-    /// `result[i]` = the speaker id that stream `i` best matches (or `nil`). Thin
-    /// wrapper over `resolve` for callers that don't need the confidence.
+    /// `result[i]` = the speaker id that stream `i` best matches (or `nil` if no
+    /// face correlates / there are fewer faces than streams).
     static func assign(streams: [[Float]],
                        timeline: VideoAnalyzer.Timeline,
                        sampleRate: Double) -> [Int?] {
-        resolve(streams: streams, timeline: timeline, sampleRate: sampleRate).mapping
-    }
-
-    /// Full result: the best injective stream→face assignment and its confidence.
-    static func resolve(streams: [[Float]],
-                        timeline: VideoAnalyzer.Timeline,
-                        sampleRate: Double) -> Assignment {
         let speakers = timeline.speakerIDs
         guard !streams.isEmpty, !speakers.isEmpty, !timeline.frames.isEmpty else {
-            return Assignment(mapping: Array(repeating: nil, count: streams.count), confidence: 0)
+            return Array(repeating: nil, count: streams.count)
         }
 
         let times = timeline.frames.map { $0.t }
@@ -69,19 +50,18 @@ enum SourceAssignment {
     }
 
     /// Injective stream→face assignment (a distinct face per stream) that maximises
-    /// the summed correlation, plus the margin to the next-best pairing. Any streams
-    /// beyond the number of faces get `nil`. Exhaustive, but the counts are tiny
-    /// (2 streams; a handful of faces).
-    private static func bestAssignment(_ corr: [[Float]], speakers: [Int]) -> Assignment {
+    /// the summed correlation. Any streams beyond the number of faces get `nil`.
+    /// Exhaustive, but the counts are tiny (2 streams; a handful of faces).
+    private static func bestAssignment(_ corr: [[Float]], speakers: [Int]) -> [Int?] {
         let streamCount = corr.count
         let faceCount = speakers.count
         var current = [Int](repeating: -1, count: streamCount)
         var used = [Bool](repeating: false, count: faceCount)
-        var scored: [(score: Float, pick: [Int])] = []
+        var best: (score: Float, pick: [Int])?
 
         func search(_ s: Int, _ score: Float) {
             if s == streamCount {
-                scored.append((score, current))
+                if best == nil || score > best!.score { best = (score, current) }
                 return
             }
             var placed = false
@@ -95,12 +75,7 @@ enum SourceAssignment {
         }
         search(0, 0)
 
-        guard let best = scored.max(by: { $0.score < $1.score }) else {
-            return Assignment(mapping: Array(repeating: nil, count: streamCount), confidence: 0)
-        }
-        let runnerUp = scored.filter { $0.pick != best.pick }.map(\.score).max()
-        let confidence = max(0, runnerUp.map { best.score - $0 } ?? best.score)
-        let mapping = best.pick.map { $0 >= 0 ? speakers[$0] : nil }
-        return Assignment(mapping: mapping, confidence: confidence)
+        guard let best else { return Array(repeating: nil, count: streamCount) }
+        return best.pick.map { $0 >= 0 ? speakers[$0] : nil }
     }
 }
