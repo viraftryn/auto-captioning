@@ -59,6 +59,22 @@ final class LiveCaptionEngine: ObservableObject {
     private let preroll: Double = 0.2           // audio kept before speech onset
     private let overlapActivityFloor: Double = 0.006
 
+    // MARK: Attribution tuning (cross-modal audio↔lip timing match)
+    // Starting points — expect to tune against the live transcript.
+    /// Need at least this many video frames in a chunk to trust a correlation;
+    /// below it, fall back to the lip-only dominant-speaker heuristic.
+    private let minCorrFrames = 8
+    /// ±frames of audio/video slack the correlation may slide to align (≈100 ms).
+    private let maxLagFrames = 3
+    /// Below this correlation the audio↔lip match is untrustworthy → fall back.
+    private let attrCorrFloor: Float = 0.15
+    /// The winning face must beat the runner-up by this much, else it's a near-tie
+    /// and we defer to the previous speaker (stickiness) instead of guessing.
+    private let attrMargin: Float = 0.12
+    /// Minimum separation-assignment confidence to trust the overlap split; below
+    /// it we skip the two-speaker path and attribute the chunk as a single speaker.
+    private let overlapConfidence: Float = 0.10
+
     // MARK: Segmenter state (segmentQueue only)
     private let segmentQueue = DispatchQueue(label: "com.aiml.livecaption.segment", qos: .userInitiated)
     private var running = false
@@ -76,6 +92,8 @@ final class LiveCaptionEngine: ObservableObject {
     // MARK: Transcription (main only) + separation (background)
     private var transcriber: Transcriber?
     private let sepRunner = SepFormerRunner()
+    /// Last single-speaker attribution, for cross-chunk stickiness (main only).
+    private var lastSpeaker: Int?
 
     // MARK: - Lifecycle
 
@@ -84,6 +102,7 @@ final class LiveCaptionEngine: ObservableObject {
     func start() {
         transcript = []
         errorText = nil
+        lastSpeaker = nil
         segmentQueue.async {
             guard !self.running else { return }
             self.running = true
@@ -227,8 +246,16 @@ final class LiveCaptionEngine: ObservableObject {
         if chunk.sawOverlap {
             do {
                 let streams = try await sepRunner.separate(chunk.samples)
-                if await transcribeOverlap(chunk, streams: streams, using: transcriber) { return }
-                // No stream produced usable text → fall through to single-speaker.
+                let resolved = SourceAssignment.resolve(streams: streams,
+                                                        timeline: Self.miniTimeline(from: chunk),
+                                                        sampleRate: sr)
+                // Only take the two-speaker path when the split matched two faces
+                // clearly better one way than swapped; a near-tie means we'd be
+                // guessing which stream is whom, so fall back to single-speaker.
+                if resolved.confidence >= overlapConfidence,
+                   await transcribeOverlap(chunk, streams: streams, mapping: resolved.mapping,
+                                           using: transcriber) { return }
+                // Low-confidence split or no usable text → fall through to single-speaker.
             } catch let e as SepFormerSeparator.SeparationError {
                 if case .modelMissing = e { separationUnavailable = true }
                 else { errorText = e.errorDescription }
@@ -240,7 +267,8 @@ final class LiveCaptionEngine: ObservableObject {
     }
 
     /// Single-speaker path: transcribe the chunk directly and attribute it to the
-    /// speaker whose lips moved most during it (`nil` if no face was active).
+    /// speaker whose lips best track the audio during it (`nil` if no face was
+    /// active) — see `attributedSpeaker`.
     @MainActor
     private func transcribeSingle(_ chunk: AudioChunk, using transcriber: Transcriber) async {
         let segments = await transcriber.transcribe(chunk.samples)
@@ -248,7 +276,7 @@ final class LiveCaptionEngine: ObservableObject {
         let text = Self.joinText(segments)
         guard !text.isEmpty else { return }
         errorText = nil
-        append([AttributedUtterance(speaker: Self.dominantSpeaker(chunk), text: text,
+        append([AttributedUtterance(speaker: attributedSpeaker(for: chunk), text: text,
                                     start: chunk.start, end: chunk.end)])
     }
 
@@ -256,11 +284,9 @@ final class LiveCaptionEngine: ObservableObject {
     /// own, and emit one attributed line per speaker. Returns whether it produced
     /// any text (so the caller can fall back to single-speaker if not).
     @MainActor
-    private func transcribeOverlap(_ chunk: AudioChunk, streams: [[Float]],
+    private func transcribeOverlap(_ chunk: AudioChunk, streams: [[Float]], mapping: [Int?],
                                    using transcriber: Transcriber) async -> Bool {
         separationUnavailable = false
-        let timeline = Self.miniTimeline(from: chunk)
-        let mapping = SourceAssignment.assign(streams: streams, timeline: timeline, sampleRate: sr)
 
         // Skip a near-silent stream (SepFormer emits two even when only one voice is
         // present) so Whisper doesn't hallucinate a spurious line from separation
@@ -295,8 +321,58 @@ final class LiveCaptionEngine: ObservableObject {
 
     // MARK: - Helpers
 
-    /// The speaker whose lips moved most across the chunk — the single-speaker
-    /// attribution. `nil` if no face was active (e.g. an off-screen speaker).
+    /// Pick the speaker for a single-speaker chunk by **cross-modal timing match**:
+    /// the face whose lip activity best tracks the chunk's audio energy over time
+    /// (see `CrossModalCorrelation`), not merely the face that moved its lips most —
+    /// so a silent bystander's mouth movement can't steal the caption. Guards keep
+    /// it honest:
+    ///  • too few frames / no faces → fall back to the lip-only dominant speaker;
+    ///  • best correlation below `attrCorrFloor` (voice likely off-screen) → same;
+    ///  • a near-tie with a rival (< `attrMargin`) → keep the previous speaker
+    ///    rather than guess, which is what stops labels flip-flopping line to line.
+    /// Returns `nil` only when no face is a plausible source.
+    @MainActor
+    private func attributedSpeaker(for chunk: AudioChunk) -> Int? {
+        let times = chunk.activity.map { $0.t }
+        let faces = Set(chunk.activity.flatMap { $0.byId.keys }).sorted()
+        guard !faces.isEmpty, times.count >= minCorrFrames else {
+            return stick(Self.dominantSpeaker(chunk))
+        }
+
+        let audioEnv = CrossModalCorrelation.zscore(
+            CrossModalCorrelation.energyEnvelope(chunk.samples, at: times, sampleRate: sr))
+        var scored = faces.map { id -> (id: Int, corr: Float) in
+            let lip = CrossModalCorrelation.zscore(chunk.activity.map { Float($0.byId[id] ?? 0) })
+            return (id, CrossModalCorrelation.bestLaggedCorrelation(audioEnv, lip, maxLag: maxLagFrames))
+        }
+        scored.sort { $0.corr > $1.corr }
+
+        guard let top = scored.first, top.corr >= attrCorrFloor else {
+            return stick(Self.dominantSpeaker(chunk))
+        }
+        let runnerUp = scored.count > 1 ? scored[1].corr : -.greatestFiniteMagnitude
+        if faces.count == 1 || (top.corr - runnerUp) >= attrMargin {
+            lastSpeaker = top.id
+            return top.id
+        }
+        // Near-tie: defer to the previous speaker if they're still a close contender.
+        if let last = lastSpeaker, scored.prefix(2).contains(where: { $0.id == last }) {
+            return last
+        }
+        lastSpeaker = top.id
+        return top.id
+    }
+
+    /// Remember a non-nil attribution for cross-chunk stickiness, then return it.
+    @MainActor
+    private func stick(_ id: Int?) -> Int? {
+        if let id { lastSpeaker = id }
+        return id
+    }
+
+    /// Lip-only fallback attribution: the speaker whose lips moved most across the
+    /// chunk. Used when there aren't enough frames to correlate, or the audio↔lip
+    /// match is too weak to trust. `nil` if no face was active (off-screen speaker).
     private static func dominantSpeaker(_ chunk: AudioChunk) -> Int? {
         var sum: [Int: Double] = [:]
         for frame in chunk.activity {
