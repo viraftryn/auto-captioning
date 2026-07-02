@@ -12,9 +12,12 @@ struct LiveCaptureView: View {
             VStack(spacing: 0) {
                 ZStack(alignment: .top) {
                     CameraPreview(session: capture.session, faces: capture.trackedFaces)
-                        .frame(minWidth: 560, minHeight: 360)
+                        .frame(minWidth: 560, minHeight: 300)
                     topOverlay.padding(12)
                 }
+                Divider()
+                LiveTranscriptView(engine: capture.live)
+                    .frame(height: 200)
                 controlBar
             }
             Divider()
