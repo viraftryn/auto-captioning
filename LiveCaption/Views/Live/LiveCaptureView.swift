@@ -3,38 +3,26 @@ import SwiftUI
 struct LiveCaptureView: View {
     @ObservedObject var capture: CaptureManager
 
-    @State private var talkThreshold: Double = 0.008
-    @State private var holdTime: Double = 0.35
-    @State private var speechMargin: Double = 6
+    @State private var captionPresenter = CaptionWindowPresenter()
 
     var body: some View {
-        HStack(spacing: 0) {
-            VStack(spacing: 0) {
-                ZStack(alignment: .top) {
-                    CameraPreview(session: capture.session, faces: capture.trackedFaces)
-                        .frame(minWidth: 560, minHeight: 300)
-                    topOverlay.padding(12)
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    ZStack(alignment: .top) {
+                        CameraPreview(session: capture.session, faces: capture.trackedFaces)
+                            .frame(minWidth: 560, minHeight: 300)
+                        topOverlay.padding(12)
+                    }
+                    Divider()
+                    LiveTranscriptView(engine: capture.live)
+                        .frame(height: 200)
                 }
                 Divider()
-                LiveTranscriptView(engine: capture.live)
-                    .frame(height: 200)
-                controlBar
+                speakerSidebar.frame(width: 250)
             }
-            Divider()
-            speakerSidebar.frame(width: 250)
+            controlBar
         }
-        .onAppear {
-            pushConfig()
-            capture.setSpeechMargin(Float(speechMargin))
-        }
-    }
-
-    private func pushConfig() {
-        var config = LipActivityConfig()
-        config.activityOn = talkThreshold
-        config.activityOff = talkThreshold * 0.6
-        config.holdTime = holdTime
-        capture.setConfig(config)
     }
 
     // MARK: - Preview overlay (badge + overlap banner)
@@ -90,8 +78,6 @@ struct LiveCaptureView: View {
                 }
                 .padding()
             }
-            Divider()
-            tuningPanel.padding()
         }
         .background(.background)
     }
@@ -138,27 +124,6 @@ struct LiveCaptureView: View {
         }
     }
 
-    private var tuningPanel: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Tuning").font(.subheadline.weight(.semibold))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Talk threshold: \(String(format: "%.3f", talkThreshold))").font(.caption)
-                Slider(value: $talkThreshold, in: 0.002...0.030)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Hold time: \(String(format: "%.2f", holdTime)) s").font(.caption)
-                Slider(value: $holdTime, in: 0.1...1.0)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Speech margin: \(String(format: "%.0f", speechMargin)) dB").font(.caption)
-                Slider(value: $speechMargin, in: 2...15)
-            }
-        }
-        .onChange(of: talkThreshold) { pushConfig() }
-        .onChange(of: holdTime) { pushConfig() }
-        .onChange(of: speechMargin) { capture.setSpeechMargin(Float(speechMargin)) }
-    }
-
     // MARK: - Control bar
 
     private var controlBar: some View {
@@ -178,6 +143,11 @@ struct LiveCaptureView: View {
             speechIndicator
 
             Spacer()
+
+            Button { captionPresenter.show(capture: capture) } label: {
+                Label("Caption window", systemImage: "text.below.photo")
+            }
+            .help("Open the clean caption view in a separate window")
 
             Text(capture.statusMessage)
                 .font(.callout)

@@ -201,7 +201,7 @@ struct AnalysisView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(model.attributedTranscript) { utterance in
                         HStack(alignment: .top, spacing: 8) {
-                            Text(utterance.speaker != nil ? "Speaker \(utterance.speaker!)" : "?")
+                            Text(utterance.speaker != nil ? "Speaker \(utterance.speaker!)" : "Off-Cam Speaker")
                                 .font(.caption2.weight(.bold))
                                 .padding(.horizontal, 7).padding(.vertical, 3)
                                 .background(speakerColor(utterance.speaker), in: Capsule())

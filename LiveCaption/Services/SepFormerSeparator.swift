@@ -153,6 +153,39 @@ final class SepFormerSeparator {
         return streams.map { Array($0.prefix(n)) }
     }
 
+    /// Separate a live chunk using REAL preceding audio as context.
+    ///
+    /// `separateWindow` zero-pads a short chunk to fill the window; a brief overlap
+    /// then gives the transformer almost no context and separates poorly. Here the
+    /// chunk is placed at the END of the window and preceded by up to
+    /// `windowLength - chunk.count` samples of `leadingContext` (front zero-padded
+    /// if shorter). Only the chunk region of each separated stream is returned, so
+    /// the caller still gets exactly `chunk.count` samples per source -- but the
+    /// model saw the run-up to the overlap, which markedly improves the split.
+    func separateChunk(_ chunk: [Float], leadingContext: [Float]) throws -> [[Float]] {
+        let n = chunk.count
+        guard n > 0 else { return Array(repeating: [], count: sourceCount) }
+        guard n < windowLength else { return try separateWindow(chunk) }
+
+        let ctxLen = min(leadingContext.count, windowLength - n)
+        var window = [Float](repeating: 0, count: windowLength)
+        window.withUnsafeMutableBufferPointer { dst in
+            if ctxLen > 0 {
+                leadingContext.withUnsafeBufferPointer { src in
+                    dst.baseAddress!.advanced(by: windowLength - n - ctxLen)
+                        .update(from: src.baseAddress! + (src.count - ctxLen), count: ctxLen)
+                }
+            }
+            chunk.withUnsafeBufferPointer { src in
+                dst.baseAddress!.advanced(by: windowLength - n)
+                    .update(from: src.baseAddress!, count: n)
+            }
+        }
+        let streams = try infer(window)
+        let lo = windowLength - n
+        return streams.map { Array($0[lo..<windowLength]) }
+    }
+
     /// Should the current window's two streams be swapped to match the previous
     /// window? Compares each window's leading overlap region (same time span) by
     /// normalised cross-correlation and picks the higher-scoring pairing.
