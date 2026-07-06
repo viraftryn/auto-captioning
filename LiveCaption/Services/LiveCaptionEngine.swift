@@ -56,13 +56,15 @@ final class LiveCaptionEngine: ObservableObject {
     /// Cap for a NORMAL (single / turn-taking) chunk -- just under the SepFormer 4.0s
     /// window so it fits one model pass. Overlap segments use `maxOverlapChunk`.
     private let maxChunk: Double = 3.8
-    /// Cap for an overlap segment. Kept SHORT so overlaps are separated + captioned
-    /// promptly and stream as they happen (a long cap made captions appear seconds
-    /// late and, while one long segment was processing, dropped incoming speech).
-    /// Being under 4s also leaves the SepFormer window room for real context, which
-    /// improves the split. Continuous overlap therefore streams as consecutive
-    /// ~3s pieces rather than one delayed block.
-    private let maxOverlapChunk: Double = 3.0
+    /// Cap for an overlap segment. Set LONG (30s) so a whole continuous simultaneous
+    /// exchange is separated + assigned as ONE piece -- SepFormer's cross-window
+    /// permutation continuity plus the whole-segment SourceAssignment then keep
+    /// Speaker 1/2 stable, and Whisper gets maximal context (its own 30s limit).
+    /// TRADE-OFF: the caption for such an overlap only appears after it ends (up to
+    /// ~30s) plus heavy inference -- closer to delayed transcription than live for a
+    /// long continuous overlap. (SepFormer still only ever sees 4s per window; the
+    /// gain here is label stability, not per-window separation quality.)
+    private let maxOverlapChunk: Double = 30.0
     private let pauseToClose: Double = 0.35     // silence after speech that ends a chunk
     private let minChunk: Double = 0.4          // drop anything shorter than this
     private let preroll: Double = 0.2           // audio kept before speech onset
@@ -109,7 +111,7 @@ final class LiveCaptionEngine: ObservableObject {
             self.history = []
             self.sessionStartWall = CACurrentMediaTime()
             let (stream, cont) = AsyncStream.makeStream(of: AudioChunk.self,
-                                                        bufferingPolicy: .bufferingNewest(6))
+                                                        bufferingPolicy: .bufferingNewest(16))
             self.continuation = cont
             Task { @MainActor [weak self] in
                 for await chunk in stream {
@@ -178,7 +180,9 @@ final class LiveCaptionEngine: ObservableObject {
             }
 
             self.activityLog.append((now, byId))
-            let cutoff = now - 12
+            // Keep enough activity history to cover a whole overlap segment, so
+            // SourceAssignment has per-speaker activity across its full length.
+            let cutoff = now - (self.maxOverlapChunk + 2)
             if let idx = self.activityLog.firstIndex(where: { $0.wall >= cutoff }), idx > 0 {
                 self.activityLog.removeFirst(idx)
             }
