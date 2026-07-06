@@ -56,7 +56,11 @@ final class SepFormerSeparator {
         do {
             let compiled = try Self.compiledModelURL(for: packageURL)
             let config = MLModelConfiguration()
-            config.computeUnits = .all
+            // NOT .all: the Neural Engine can't host this transformer, and requesting
+            // it makes CoreML spend ~80s on a FAILING ANE compile on the first
+            // prediction (MILCompilerForANE / ANECCompile FAILED) before falling back
+            // to GPU -- which stalls the whole pipeline and drops audio. Pin to GPU/CPU.
+            config.computeUnits = .cpuAndGPU
             self.model = try MLModel(contentsOf: compiled, configuration: config)
         } catch let e as SeparationError {
             throw e

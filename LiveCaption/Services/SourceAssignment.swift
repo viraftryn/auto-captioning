@@ -17,10 +17,25 @@ enum SourceAssignment {
     static func assign(streams: [[Float]],
                        timeline: VideoAnalyzer.Timeline,
                        sampleRate: Double) -> [Int?] {
+        let (corr, speakers) = correlations(streams: streams, timeline: timeline, sampleRate: sampleRate)
+        guard !corr.isEmpty else { return Array(repeating: nil, count: streams.count) }
+        // Assign a DISTINCT face to each stream maximising the *total* correlation.
+        // A greedy pick-the-best-pair-first can lock in a locally-best pair that
+        // forces the other stream onto the wrong face (→ swapped speakers); the
+        // globally-best pairing avoids that and is cheap here (2 streams).
+        return bestAssignment(corr, speakers: speakers)
+    }
+
+    /// The raw cross-modal correlation matrix (`matrix[stream][speakerIndex]`, a
+    /// z-scored dot ≈ Pearson r of each stream's energy envelope against each face's
+    /// lip-activity envelope) plus the `speakers` order the columns follow. Exposed
+    /// so callers (the live engine) can blend it with a cross-chunk continuity term
+    /// before picking the assignment. Empty matrix if there's nothing to correlate.
+    static func correlations(streams: [[Float]],
+                             timeline: VideoAnalyzer.Timeline,
+                             sampleRate: Double) -> (matrix: [[Float]], speakers: [Int]) {
         let speakers = timeline.speakerIDs
-        guard !streams.isEmpty, !speakers.isEmpty, !timeline.frames.isEmpty else {
-            return Array(repeating: nil, count: streams.count)
-        }
+        guard !streams.isEmpty, !speakers.isEmpty, !timeline.frames.isEmpty else { return ([], []) }
 
         let times = timeline.frames.map { $0.t }
         let streamEnv = streams.map { zscore(energyEnvelope($0, at: times, sampleRate: sampleRate)) }
@@ -28,7 +43,6 @@ enum SourceAssignment {
             (id, zscore(timeline.frames.map { Float($0.activity[id] ?? 0) }))
         })
 
-        // Correlation matrix: streams × speakers (z-scored dot ≈ Pearson r).
         let denom = Float(max(1, times.count))
         var corr = [[Float]](repeating: [Float](repeating: 0, count: speakers.count),
                              count: streams.count)
@@ -37,18 +51,13 @@ enum SourceAssignment {
                 corr[i][j] = dot(env, faceEnv[id]!) / denom
             }
         }
-
-        // Assign a DISTINCT face to each stream maximising the *total* correlation.
-        // A greedy pick-the-best-pair-first can lock in a locally-best pair that
-        // forces the other stream onto the wrong face (→ swapped speakers); the
-        // globally-best pairing avoids that and is cheap here (2 streams).
-        return bestAssignment(corr, speakers: speakers)
+        return (corr, speakers)
     }
 
     /// Injective stream→face assignment (a distinct face per stream) that maximises
     /// the summed correlation. Any streams beyond the number of faces get `nil`.
     /// Exhaustive, but the counts are tiny (2 streams; a handful of faces).
-    private static func bestAssignment(_ corr: [[Float]], speakers: [Int]) -> [Int?] {
+    static func bestAssignment(_ corr: [[Float]], speakers: [Int]) -> [Int?] {
         let streamCount = corr.count
         let faceCount = speakers.count
         var current = [Int](repeating: -1, count: streamCount)

@@ -93,6 +93,15 @@ final class LiveCaptionEngine: ObservableObject {
     private var transcriber: Transcriber?
     private let sepRunner = SepFormerRunner()
 
+    // Cross-chunk continuity for the overlap path (main only): keeps Speaker 1/2
+    // labels stable across consecutive overlap chunks by blending an acoustic-tail
+    // continuity term into the cross-modal (audio<->lip) assignment.
+    private var faceTail: [Int: [Float]] = [:]   // recent energy-envelope tail per face
+    private var lastOverlapEnd: Double = -1       // session time the previous overlap chunk ended
+    private let tailSeconds: Double = 0.2         // overlap region compared for continuity
+    private let overlapGapMax: Double = 0.6       // max gap to treat two overlap chunks as one episode
+    private let continuityWeight: Float = 2.0     // weight of the continuity term vs cross-modal
+
     // MARK: - Lifecycle
 
     /// Begin a fresh captioning session: clears the transcript and starts the
@@ -100,6 +109,9 @@ final class LiveCaptionEngine: ObservableObject {
     func start() {
         transcript = []
         errorText = nil
+        faceTail = [:]
+        lastOverlapEnd = -1
+        sepRunner.warmUp()   // compile SepFormer now, not on the first overlap mid-talk
         segmentQueue.async {
             guard !self.running else { return }
             self.running = true
@@ -365,19 +377,46 @@ final class LiveCaptionEngine: ObservableObject {
                                    using transcriber: Transcriber) async -> Bool {
         separationUnavailable = false
         let timeline = Self.miniTimeline(from: chunk)
-        let mapping = SourceAssignment.assign(streams: streams, timeline: timeline, sampleRate: sr)
+
+        // Cross-modal (audio<->lip) correlation of each stream vs each face.
+        let (cmCorr, faces) = SourceAssignment.correlations(streams: streams, timeline: timeline, sampleRate: sr)
+        guard !cmCorr.isEmpty, !faces.isEmpty else { return false }
+
+        // Cross-chunk continuity: if this overlap chunk is contiguous with the last
+        // one, blend an acoustic-tail term into the correlation. Each stream's leading
+        // ~0.2s overlaps the previous chunk's trailing ~0.2s (same audio), so the
+        // matching voice's energy envelope lines up with the stored face tail. This
+        // keeps Speaker 1/2 from flipping between chunks while still grounding identity
+        // in the cross-modal assignment.
+        var corr = cmCorr
+        let contiguous = (chunk.start - lastOverlapEnd) < overlapGapMax && !faceTail.isEmpty
+        if contiguous {
+            let leadN = Int(tailSeconds * sr)
+            let leads = streams.map { Self.envelope(Array($0.prefix(leadN))) }
+            for i in streams.indices where i < corr.count {
+                for (j, f) in faces.enumerated() where j < corr[i].count {
+                    if let tail = faceTail[f] {
+                        corr[i][j] += continuityWeight * Self.envelopeCorr(leads[i], tail)
+                    }
+                }
+            }
+        }
+        let mapping = SourceAssignment.bestAssignment(corr, speakers: faces)
 
         // Skip only a near-silent stream (SepFormer emits two even when one voice is
         // present) so Whisper doesn't hallucinate from separation residue. The ratio
-        // is kept low so a genuinely quieter second speaker still produces a line --
-        // the earlier 0.15 could drop a real, softer voice.
+        // is kept low so a genuinely quieter second speaker still produces a line.
         let energies = streams.map { Self.rms($0) }
         let loudest = energies.max() ?? 0
+        let tailN = Int(tailSeconds * sr)
 
         var lines: [AttributedUtterance] = []
         for (i, stream) in streams.enumerated() {
             guard i < mapping.count, let speaker = mapping[i], !stream.isEmpty else { continue }
             guard energies[i] > 1e-3, energies[i] > 0.08 * loudest else { continue }
+            // Remember this face's recent audio tail for the next chunk's continuity
+            // (only a stream that actually carried this speaker's voice).
+            faceTail[speaker] = Self.envelope(Array(stream.suffix(tailN)))
             let segments = await transcriber.transcribe(stream)
             if case .failed(let message) = transcriber.status { errorText = message; continue }
             let text = Self.joinText(segments)
@@ -386,6 +425,7 @@ final class LiveCaptionEngine: ObservableObject {
                                                  start: chunk.start, end: chunk.end))
             }
         }
+        lastOverlapEnd = chunk.end
 
         guard !lines.isEmpty else { return false }
         errorText = nil
@@ -477,6 +517,49 @@ final class LiveCaptionEngine: ObservableObject {
         return ms.squareRoot()
     }
 
+    /// Coarse RMS energy envelope over ~10 ms frames — a shift-tolerant signal for
+    /// matching the shared overlap region between consecutive chunks.
+    private static func envelope(_ signal: [Float]) -> [Float] {
+        let frame = 160   // 10 ms @ 16 kHz
+        guard signal.count >= frame else { return [] }
+        var env: [Float] = []
+        env.reserveCapacity(signal.count / frame)
+        signal.withUnsafeBufferPointer { p in
+            guard let base = p.baseAddress else { return }
+            var i = 0
+            while i + frame <= signal.count {
+                var ms: Float = 0
+                vDSP_measqv(base + i, 1, &ms, vDSP_Length(frame))
+                env.append(ms.squareRoot())
+                i += frame
+            }
+        }
+        return env
+    }
+
+    /// Pearson correlation of two energy envelopes, in [-1, 1] (0 if too short).
+    private static func envelopeCorr(_ a: [Float], _ b: [Float]) -> Float {
+        let n = min(a.count, b.count)
+        guard n >= 2 else { return 0 }
+        let za = zscoreVec(Array(a.prefix(n)))
+        let zb = zscoreVec(Array(b.prefix(n)))
+        var r: Float = 0
+        vDSP_dotpr(za, 1, zb, 1, &r, vDSP_Length(n))
+        return r / Float(n)
+    }
+
+    private static func zscoreVec(_ x: [Float]) -> [Float] {
+        let n = vDSP_Length(x.count)
+        guard x.count > 1 else { return [Float](repeating: 0, count: x.count) }
+        var mean: Float = 0; vDSP_meanv(x, 1, &mean, n)
+        var neg = -mean
+        var c = [Float](repeating: 0, count: x.count); vDSP_vsadd(x, 1, &neg, &c, 1, n)
+        var ms: Float = 0; vDSP_measqv(c, 1, &ms, n)
+        let sd = ms.squareRoot(); guard sd > 1e-9 else { return [Float](repeating: 0, count: x.count) }
+        var inv = 1 / sd; var out = [Float](repeating: 0, count: x.count)
+        vDSP_vsmul(c, 1, &inv, &out, 1, n); return out
+    }
+
     private static func message(_ error: Error) -> String {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
@@ -503,6 +586,20 @@ private final class SepFormerRunner: @unchecked Sendable {
                 } catch {
                     continuation.resume(throwing: error)
                 }
+            }
+        }
+    }
+
+    /// Compile + run one dummy inference off the critical path, so the first real
+    /// overlap doesn't pay the model warm-up cost mid-conversation.
+    func warmUp() {
+        queue.async {
+            guard self.separator == nil else { return }
+            do {
+                self.separator = try SepFormerSeparator()
+                _ = try self.separator!.separateWindow([Float](repeating: 0, count: 64_000))
+            } catch {
+                self.separator = nil   // let the real call surface the error (e.g. modelMissing)
             }
         }
     }
