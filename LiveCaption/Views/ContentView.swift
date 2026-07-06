@@ -27,9 +27,10 @@ struct ContentView: View {
             case .analyze: AnalysisView()
             }
         }
-        .onAppear { if mode == .live { capture.start() } }
         .onChange(of: mode) { _, newMode in
-            if newMode == .analyze { capture.stop() } else { capture.start() }
+            // The camera starts only when the user presses Start (it's off at launch).
+            // Just release it when leaving Live for the file analyzer.
+            if newMode == .analyze { capture.stop() }
         }
     }
 }

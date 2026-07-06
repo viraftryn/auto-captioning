@@ -36,7 +36,9 @@ final class LiveCaptionEngine: ObservableObject {
         let start: Double                               // seconds since session start
         let end: Double
         let activity: [(t: Double, byId: [Int: Double])] // per-frame lip activity, chunk-local time
-        let sawOverlap: Bool                            // sustained 2+ faces active during the chunk
+        let sawOverlap: Bool                            // 2+ faces active during the chunk
+        let leadingContext: [Float]                     // real audio just before the chunk (overlap only)
+        let activityFloor: Double                       // "is speaking" threshold at close time
     }
 
     // MARK: Published (main thread only)
@@ -46,19 +48,28 @@ final class LiveCaptionEngine: ObservableObject {
     /// Set once if an overlap chunk arrives but the SepFormer model isn't installed;
     /// overlaps then fall back to single-speaker until it's produced.
     @Published private(set) var separationUnavailable = false
-    @Published var model: WhisperModelSize = .small
+    @Published var model: WhisperModelSize = .large
     @Published var captioning = true { didSet { setEnabled(captioning) } }
 
     // MARK: Tuning
     private let sr: Double = 16_000
-    /// Hard cap on chunk length. Kept just under the SepFormer 4.0s window so a
-    /// near-cap overlap chunk (which overshoots by one audio buffer) still fits in
-    /// one model pass rather than triggering the windowed path.
+    /// Cap for a NORMAL (single / turn-taking) chunk -- just under the SepFormer 4.0s
+    /// window so it fits one model pass. Overlap segments use `maxOverlapChunk`.
     private let maxChunk: Double = 3.8
+    /// Cap for an overlap segment. Kept SHORT so overlaps are separated + captioned
+    /// promptly and stream as they happen (a long cap made captions appear seconds
+    /// late and, while one long segment was processing, dropped incoming speech).
+    /// Being under 4s also leaves the SepFormer window room for real context, which
+    /// improves the split. Continuous overlap therefore streams as consecutive
+    /// ~3s pieces rather than one delayed block.
+    private let maxOverlapChunk: Double = 3.0
     private let pauseToClose: Double = 0.35     // silence after speech that ends a chunk
     private let minChunk: Double = 0.4          // drop anything shorter than this
     private let preroll: Double = 0.2           // audio kept before speech onset
-    private let overlapActivityFloor: Double = 0.006
+    private var overlapActivityFloor: Double = 0.006  // "is speaking" threshold; tracks the Talk slider
+    private let overlapHold: Double = 0.3       // overlap stays "active" this long after the last 2-active frame
+    private let overlapEndDelay: Double = 0.4   // close an overlap segment this long after overlap ends
+    private let historySeconds: Double = 4.0    // rolling raw-audio kept as SepFormer context
 
     // MARK: Segmenter state (segmentQueue only)
     private let segmentQueue = DispatchQueue(label: "com.aiml.livecaption.segment", qos: .userInitiated)
@@ -71,7 +82,11 @@ final class LiveCaptionEngine: ObservableObject {
     private var chunkStartWall: Double = 0       // speech onset (pause/cap timing)
     private var chunkAudioStartWall: Double = 0  // wall time of the chunk's first sample (incl. preroll)
     private var lastSpeechWall: Double = 0
+    private var overlapActiveUntil: Double = 0   // simultaneous overlap "sticks" until this wall time
+    private var overlapStreak: Int = 0           // consecutive 2+-active frames (single-frame glitch guard)
+    private var sawOverlapInChunk = false        // simultaneous overlap occurred during the current chunk
     private var activityLog: [(wall: Double, byId: [Int: Double])] = []
+    private var history: [Float] = []           // rolling last `historySeconds` of audio
     private var continuation: AsyncStream<AudioChunk>.Continuation?
 
     // MARK: Transcription (main only) + separation (background)
@@ -91,6 +106,7 @@ final class LiveCaptionEngine: ObservableObject {
             self.enabledFlag = true
             self.resetChunkLocked()
             self.activityLog = []
+            self.history = []
             self.sessionStartWall = CACurrentMediaTime()
             let (stream, cont) = AsyncStream.makeStream(of: AudioChunk.self,
                                                         bufferingPolicy: .bufferingNewest(6))
@@ -112,6 +128,7 @@ final class LiveCaptionEngine: ObservableObject {
             self.continuation = nil
             self.resetChunkLocked()
             self.activityLog = []
+            self.history = []
         }
         isBusy = false
     }
@@ -122,6 +139,13 @@ final class LiveCaptionEngine: ObservableObject {
             self.enabledFlag = on
             if !on { self.resetChunkLocked() }
         }
+    }
+
+    /// Keep the engine's "is speaking" threshold in step with the UI Talk slider, so
+    /// overlap detection and per-speaker splitting use the same sensitivity the user
+    /// tuned for active-speaker detection.
+    func setActivityFloor(_ value: Double) {
+        segmentQueue.async { self.overlapActivityFloor = max(0.001, value) }
     }
 
     // MARK: - Ingest (called from capture queues)
@@ -142,6 +166,17 @@ final class LiveCaptionEngine: ObservableObject {
         segmentQueue.async {
             guard self.running, self.enabledFlag else { return }
             if self.sessionStartWall == 0 { self.sessionStartWall = now }
+
+            // Track sustained simultaneous overlap (2+ faces speaking). A short streak
+            // guards against single-frame glitches; a hold keeps it "active" briefly.
+            let activeCount = byId.values.filter { $0 >= self.overlapActivityFloor }.count
+            if activeCount >= 2 {
+                self.overlapStreak += 1
+                if self.overlapStreak >= 2 { self.overlapActiveUntil = now + self.overlapHold }
+            } else {
+                self.overlapStreak = 0
+            }
+
             self.activityLog.append((now, byId))
             let cutoff = now - 12
             if let idx = self.activityLog.firstIndex(where: { $0.wall >= cutoff }), idx > 0 {
@@ -153,6 +188,12 @@ final class LiveCaptionEngine: ObservableObject {
     // MARK: - Segmentation (segmentQueue only)
 
     private func appendAudioLocked(_ samples: [Float], now: Double, isSpeech: Bool) {
+        // Rolling recent-audio buffer: gives SepFormer real audio from just before an
+        // overlap chunk as context, instead of zero-padding a short window.
+        history.append(contentsOf: samples)
+        let maxHistory = Int(historySeconds * sr)
+        if history.count > maxHistory { history.removeFirst(history.count - maxHistory) }
+
         // Between chunks: keep a short rolling backlog so the next chunk includes a
         // little audio from just before the speech onset (avoids clipped first words).
         if !accumulating {
@@ -167,13 +208,26 @@ final class LiveCaptionEngine: ObservableObject {
                 chunkStartWall = now
                 chunkAudioStartWall = now - prerollSec
                 lastSpeechWall = now
+                sawOverlapInChunk = now < overlapActiveUntil
             }
             return
         }
 
         pending.append(contentsOf: samples)
         if isSpeech { lastSpeechWall = now }
-        if (now - lastSpeechWall) >= pauseToClose || (now - chunkStartWall) >= maxChunk {
+        if now < overlapActiveUntil { sawOverlapInChunk = true }
+
+        let pause = (now - lastSpeechWall) >= pauseToClose
+        if sawOverlapInChunk {
+            // Overlap segment: close promptly so it's separated + captioned without
+            // delay -- on a real pause, shortly after the overlap actually ends (so a
+            // brief interjection doesn't linger), or at the short overlap cap.
+            // Continuous overlap therefore streams as consecutive short pieces.
+            let overlapEnded = now >= overlapActiveUntil + overlapEndDelay
+            if pause || overlapEnded || (now - chunkStartWall) >= maxOverlapChunk {
+                closeChunkLocked(endWall: now)
+            }
+        } else if pause || (now - chunkStartWall) >= maxChunk {
             closeChunkLocked(endWall: now)
         }
     }
@@ -195,15 +249,21 @@ final class LiveCaptionEngine: ObservableObject {
             .filter { $0.wall >= lo && $0.wall <= hi }
             .map { (t: max(0, $0.wall - chunkAudioStartWall), byId: $0.byId) }
 
-        // Require sustained overlap (not one stray frame) before paying for SepFormer.
-        let overlapFrames = activity.filter {
-            $0.byId.values.filter { $0 >= overlapActivityFloor }.count >= 2
-        }.count
-        let sawOverlap = overlapFrames >= max(3, activity.count / 10)
+        // Whether simultaneous overlap happened during this chunk, tracked live from
+        // the activity stream (streak + hold guard). Overlap chunks were grown to
+        // capture the whole exchange, so this is the whole segment.
+        let sawOverlap = sawOverlapInChunk
+
+        // For overlap chunks, hand the separator the real audio from just before the
+        // chunk (drop the chunk's own tail from the rolling history) as context.
+        let context: [Float] = sawOverlap
+            ? Array(history.dropLast(min(history.count, samples.count)))
+            : []
 
         continuation?.yield(AudioChunk(samples: samples, start: startRel,
                                        end: startRel + duration,
-                                       activity: activity, sawOverlap: sawOverlap))
+                                       activity: activity, sawOverlap: sawOverlap,
+                                       leadingContext: context, activityFloor: overlapActivityFloor))
     }
 
     private func resetChunkLocked() {
@@ -213,6 +273,9 @@ final class LiveCaptionEngine: ObservableObject {
         chunkStartWall = 0
         chunkAudioStartWall = 0
         lastSpeechWall = 0
+        overlapActiveUntil = 0
+        overlapStreak = 0
+        sawOverlapInChunk = false
     }
 
     // MARK: - Processing (main only)
@@ -228,7 +291,7 @@ final class LiveCaptionEngine: ObservableObject {
 
         if chunk.sawOverlap {
             do {
-                let streams = try await sepRunner.separate(chunk.samples)
+                let streams = try await sepRunner.separate(chunk.samples, context: chunk.leadingContext)
                 if await transcribeOverlap(chunk, streams: streams, using: transcriber) { return }
                 // No stream produced usable text → fall through to single-speaker.
             } catch let e as SepFormerSeparator.SeparationError {
@@ -238,20 +301,60 @@ final class LiveCaptionEngine: ObservableObject {
                 errorText = Self.message(error)
             }
         }
-        await transcribeSingle(chunk, using: transcriber)
+        await transcribeSequential(chunk, using: transcriber)
     }
 
-    /// Single-speaker path: transcribe the chunk directly and attribute it to the
-    /// speaker whose lips moved most during it (`nil` if no face was active).
+    /// Non-overlap path. A VAD chunk can still contain fast TURN-TAKING between two
+    /// speakers (no pause, no simultaneous overlap); transcribing it whole would
+    /// label both turns as one speaker. So if a second face was meaningfully active,
+    /// split the chunk into per-speaker segments by dominant lip activity and
+    /// transcribe each; otherwise transcribe the whole chunk as one speaker.
     @MainActor
-    private func transcribeSingle(_ chunk: AudioChunk, using transcriber: Transcriber) async {
+    private func transcribeSequential(_ chunk: AudioChunk, using transcriber: Transcriber) async {
+        var totals: [Int: Double] = [:]
+        for f in chunk.activity {
+            for (id, a) in f.byId where a >= chunk.activityFloor { totals[id, default: 0] += a }
+        }
+        let ranked = totals.sorted { $0.value > $1.value }
+        let top = ranked.first
+
+        // One (or zero) meaningful speaker -> single line (unchanged behaviour).
+        let hasSecond = ranked.count >= 2 && ranked[1].value >= 0.35 * (top?.value ?? 1)
+        let segments = hasSecond ? Self.dominantSegments(chunk) : []
+        guard segments.count >= 2 else {
+            await emitWhole(chunk, speaker: top?.key, using: transcriber)
+            return
+        }
+
+        var lines: [AttributedUtterance] = []
+        for seg in segments {
+            let slice = Self.slice(chunk.samples, start: seg.start, end: seg.end, sr: sr)
+            guard Self.rms(slice) > 1e-3 else { continue }
+            let text = Self.joinText(await transcriber.transcribe(slice))
+            if case .failed(let message) = transcriber.status { errorText = message; continue }
+            if !text.isEmpty {
+                lines.append(AttributedUtterance(speaker: seg.speaker, text: text,
+                                                 start: chunk.start + seg.start,
+                                                 end: chunk.start + seg.end))
+            }
+        }
+        if lines.isEmpty {
+            await emitWhole(chunk, speaker: top?.key, using: transcriber)
+        } else {
+            errorText = nil
+            append(lines)
+        }
+    }
+
+    /// Transcribe the whole chunk as one line for `speaker`.
+    @MainActor
+    private func emitWhole(_ chunk: AudioChunk, speaker: Int?, using transcriber: Transcriber) async {
         let segments = await transcriber.transcribe(chunk.samples)
         if case .failed(let message) = transcriber.status { errorText = message; return }
         let text = Self.joinText(segments)
         guard !text.isEmpty else { return }
         errorText = nil
-        append([AttributedUtterance(speaker: Self.dominantSpeaker(chunk), text: text,
-                                    start: chunk.start, end: chunk.end)])
+        append([AttributedUtterance(speaker: speaker, text: text, start: chunk.start, end: chunk.end)])
     }
 
     /// Overlap path: match each separated stream to a face, transcribe each on its
@@ -264,16 +367,17 @@ final class LiveCaptionEngine: ObservableObject {
         let timeline = Self.miniTimeline(from: chunk)
         let mapping = SourceAssignment.assign(streams: streams, timeline: timeline, sampleRate: sr)
 
-        // Skip a near-silent stream (SepFormer emits two even when only one voice is
-        // present) so Whisper doesn't hallucinate a spurious line from separation
-        // residue: drop anything essentially silent or far quieter than the loudest.
+        // Skip only a near-silent stream (SepFormer emits two even when one voice is
+        // present) so Whisper doesn't hallucinate from separation residue. The ratio
+        // is kept low so a genuinely quieter second speaker still produces a line --
+        // the earlier 0.15 could drop a real, softer voice.
         let energies = streams.map { Self.rms($0) }
         let loudest = energies.max() ?? 0
 
         var lines: [AttributedUtterance] = []
         for (i, stream) in streams.enumerated() {
             guard i < mapping.count, let speaker = mapping[i], !stream.isEmpty else { continue }
-            guard energies[i] > 1e-3, energies[i] > 0.15 * loudest else { continue }
+            guard energies[i] > 1e-3, energies[i] > 0.08 * loudest else { continue }
             let segments = await transcriber.transcribe(stream)
             if case .failed(let message) = transcriber.status { errorText = message; continue }
             let text = Self.joinText(segments)
@@ -297,15 +401,58 @@ final class LiveCaptionEngine: ObservableObject {
 
     // MARK: - Helpers
 
-    /// The speaker whose lips moved most across the chunk — the single-speaker
-    /// attribution. `nil` if no face was active (e.g. an off-screen speaker).
-    private static func dominantSpeaker(_ chunk: AudioChunk) -> Int? {
-        var sum: [Int: Double] = [:]
-        for frame in chunk.activity {
-            for (id, a) in frame.byId { sum[id, default: 0] += a }
+    /// Split a chunk into contiguous [speaker, start, end] runs by the per-frame
+    /// dominant face. Silence gaps are filled with the surrounding speaker, runs
+    /// shorter than `minSeg` are absorbed into the previous run (flicker guard), and
+    /// adjacent same-speaker runs are merged. Times are chunk-local seconds.
+    private static func dominantSegments(_ chunk: AudioChunk) -> [(speaker: Int, start: Double, end: Double)] {
+        let frames = chunk.activity
+        guard !frames.isEmpty else { return [] }
+        let floor = chunk.activityFloor
+        let minSeg = 0.3
+
+        var dom: [Int?] = frames.map { frame in
+            frame.byId.filter { $0.value >= floor }.max { $0.value < $1.value }?.key
         }
-        guard let best = sum.max(by: { $0.value < $1.value }), best.value > 0 else { return nil }
-        return best.key
+        var last: Int? = nil
+        for i in dom.indices { if dom[i] == nil { dom[i] = last } else { last = dom[i] } }
+        var next: Int? = nil
+        for i in dom.indices.reversed() { if dom[i] == nil { dom[i] = next } else { next = dom[i] } }
+
+        let times = frames.map { $0.t }
+        let chunkEnd = Double(chunk.samples.count) / 16_000
+        func frameEnd(_ k: Int) -> Double { k + 1 < times.count ? times[k + 1] : chunkEnd }
+
+        var runs: [(spk: Int, start: Double, end: Double)] = []
+        var i = 0
+        while i < dom.count {
+            guard let spk = dom[i] else { i += 1; continue }
+            var j = i
+            while j + 1 < dom.count && dom[j + 1] == spk { j += 1 }
+            runs.append((spk, times[i], frameEnd(j)))
+            i = j + 1
+        }
+
+        var merged: [(spk: Int, start: Double, end: Double)] = []
+        for r in runs {
+            if var lastRun = merged.last, lastRun.spk == r.spk || (r.end - r.start) < minSeg {
+                lastRun.end = r.end
+                merged[merged.count - 1] = lastRun
+            } else {
+                merged.append(r)
+            }
+        }
+        return merged.map { (speaker: $0.spk, start: $0.start, end: $0.end) }
+    }
+
+    /// Extract `[start, end]` (chunk-local seconds) from the chunk samples, with a
+    /// little padding so words at the split boundary aren't clipped.
+    private static func slice(_ samples: [Float], start: Double, end: Double, sr: Double) -> [Float] {
+        let pad = 0.1
+        let lo = max(0, Int((start - pad) * sr))
+        let hi = min(samples.count, Int((end + pad) * sr))
+        guard hi > lo else { return [] }
+        return Array(samples[lo..<hi])
     }
 
     /// A per-chunk `Timeline` for `SourceAssignment`, using the chunk's local-time
@@ -342,14 +489,17 @@ private final class SepFormerRunner: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.aiml.livecaption.sepformer", qos: .userInitiated)
     private var separator: SepFormerSeparator?
 
-    /// Separate a short (≤ window) clip into blind streams in one model pass. Throws
-    /// `SepFormerSeparator.SeparationError.modelMissing` if the model isn't installed.
-    func separate(_ samples: [Float]) async throws -> [[Float]] {
+    /// Separate a short (<= window) chunk into blind streams in one model pass, using
+    /// `context` (real audio just before the chunk) to fill the window instead of
+    /// zeros. Throws `SepFormerSeparator.SeparationError.modelMissing` if the model
+    /// isn't installed.
+    func separate(_ chunk: [Float], context: [Float]) async throws -> [[Float]] {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 do {
                     if self.separator == nil { self.separator = try SepFormerSeparator() }
-                    continuation.resume(returning: try self.separator!.separateWindow(samples))
+                    continuation.resume(
+                        returning: try self.separator!.separateChunk(chunk, leadingContext: context))
                 } catch {
                     continuation.resume(throwing: error)
                 }

@@ -41,6 +41,9 @@ final class CaptureManager: NSObject, ObservableObject {
     private let detector = LipActivityDetector()
     private let vad = VoiceActivityDetector()
     private let resampler = AudioResampler()
+    /// Latest VAD speech decision, written on the audio queue and read on the video
+    /// queue so audio can sustain the visual active-speaker flag (benign Bool race).
+    private var latestSpeech = false
     private var isConfigured = false
 
     /// Live transcription pipeline (chunking → Whisper → speaker-attributed
@@ -228,7 +231,8 @@ extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate,
             guard let self else { return }
             let result = self.detector.update(observations: observations,
                                                imageSize: imageSize,
-                                               now: now)
+                                               now: now,
+                                               speechPresent: self.latestSpeech)
 
             // Feed the live transcriber this frame's per-speaker lip activity, used
             // to attribute each transcribed chunk to a speaker.
@@ -253,6 +257,7 @@ extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate,
         vad.process(meanSquare: meanSquare, now: now)
 
         let speech = vad.isSpeech
+        latestSpeech = speech
         let speechLvl = vad.speechLevel
         let energyDB = vad.energyDB
         let floorDB = vad.noiseFloorDB

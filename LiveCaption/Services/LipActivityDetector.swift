@@ -17,10 +17,11 @@ struct TrackedFace: Identifiable {
 struct LipActivityConfig {
     var smoothing: Double = 0.4           // EMA factor for LAR + activity
     var activityOn: Double = 0.008        // start "speaking" above this articulation
-    var activityOff: Double = 0.005       // stop below this (hysteresis)
-    var holdTime: TimeInterval = 0.35     // keep active this long after motion stops
+    var activityOff: Double = 0.006       // stop below this when there's NO speech (hysteresis)
+    var activitySustain: Double = 0.002   // while the VAD hears speech, this tiny motion keeps the mover active
+    var holdTime: TimeInterval = 0.8      // keep active this long after motion stops (generous grace)
     var matchIoU: CGFloat = 0.2           // min IoU to keep the same speaker id
-    var staleTimeout: TimeInterval = 0.5  // drop a speaker unseen for this long
+    var staleTimeout: TimeInterval = 30   // keep a speaker id this long while unseen (stable labels)
 }
 
 /// Associates faces across frames (stable Speaker ids), measures lip
@@ -74,7 +75,8 @@ final class LipActivityDetector {
 
     func update(observations: [VNFaceObservation],
                 imageSize: CGSize,
-                now: TimeInterval = CACurrentMediaTime()) -> Result {
+                now: TimeInterval = CACurrentMediaTime(),
+                speechPresent: Bool = false) -> Result {
 
         // 1. Associate observations to existing tracks by IoU (greedy, 1:1).
         tracks.forEach { $0.matchedObs = nil }
@@ -136,9 +138,15 @@ final class LipActivityDetector {
             track.prevLip = lip
             track.prevRef = ref
 
-            // Hysteresis + hold time keep the flag from flickering between words.
+            // Onset by lips, sustained by voice: a face activates on real lip motion,
+            // then -- crucially -- stays active as long as the VAD hears speech and the
+            // lips still show a little movement, so a still-headed talker doesn't
+            // flicker off between syllables. With no speech it falls back to the
+            // motion-only hysteresis.
             if track.isActive {
-                if track.activity >= config.activityOff { track.activeUntil = now + config.holdTime }
+                let stillMoving = track.activity >= config.activityOff
+                let voiceSustained = speechPresent && track.activity >= config.activitySustain
+                if stillMoving || voiceSustained { track.activeUntil = now + config.holdTime }
                 if now > track.activeUntil { track.isActive = false }
             } else if track.activity >= config.activityOn {
                 track.isActive = true

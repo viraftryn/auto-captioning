@@ -84,7 +84,7 @@ struct LiveTranscriptView: View {
 
     private func row(_ utterance: AttributedUtterance) -> some View {
         HStack(alignment: .top, spacing: 8) {
-            Text(utterance.speaker != nil ? "Speaker \(utterance.speaker!)" : "?")
+            Text(utterance.speaker != nil ? "Speaker \(utterance.speaker!)" : "Off-Cam Speaker")
                 .font(.caption2.weight(.bold))
                 .padding(.horizontal, 7)
                 .padding(.vertical, 3)
